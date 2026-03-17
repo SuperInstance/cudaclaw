@@ -1,5 +1,17 @@
 // CudaClaw - Rust bindings for persistent GPU kernel
 // FIXED: Memory layout now matches CUDA C++ structs exactly
+//
+// UNIFIED MEMORY BRIDGE:
+// This file contains Rust definitions that MUST match the CUDA C++ definitions
+// in kernels/shared_types.h exactly. The CommandQueue is allocated in Unified
+// Memory using cust::memory::UnifiedBuffer, allowing zero-copy access from
+// both CPU (Rust) and GPU (CUDA kernel).
+//
+// CRITICAL: Any changes to struct layouts must be updated in both:
+// - kernels/shared_types.h (CUDA C++ side)
+// - src/cuda_claw.rs (Rust side)
+//
+// Verification is done via compile-time assertions (see below)
 
 use cust::prelude::*;
 use cust::memory::{CopyDestination, DeviceBuffer, UnifiedBuffer};
@@ -194,9 +206,11 @@ pub struct CudaClawExecutor {
 
 #[derive(Debug, Clone, Copy)]
 pub enum KernelVariant {
-    Adaptive,  // Adaptive polling - balances latency and power
-    Spin,      // Pure spin - lowest latency, highest power
-    Timed,     // Timed polling - lowest power, higher latency
+    Adaptive,        // Adaptive polling - balances latency and power
+    Spin,            // Pure spin - lowest latency, highest power
+    Timed,           // Timed polling - lowest power, higher latency
+    PersistentWorker, // Persistent worker with warp-level parallelism
+    MultiBlockWorker, // Multi-block persistent worker for higher throughput
 }
 
 impl CudaClawExecutor {
@@ -256,17 +270,41 @@ impl CudaClawExecutor {
             KernelVariant::Adaptive => "cuda_claw_executor",
             KernelVariant::Spin => "cuda_claw_executor_spin",
             KernelVariant::Timed => "cuda_claw_executor_timed",
+            KernelVariant::PersistentWorker => "persistent_worker",
+            KernelVariant::MultiBlockWorker => "persistent_worker_multiblock",
         };
 
         let func = self.module.get_function(&CString::new(kernel_name)?)?;
         let mut queue_ptr = self.queue.as_device_ptr();
 
-        unsafe {
-            launch!(
-                func<<<1, 1, 0, self.stream>>>(
-                    queue_ptr
-                )
-            )?;
+        // Launch configuration based on kernel variant
+        match self.kernel_variant {
+            KernelVariant::MultiBlockWorker => {
+                // Multi-block worker: 4 blocks, 128 threads each
+                unsafe {
+                    // Launch multi-block kernel with block_id parameters
+                    let block_id = 0u32;
+                    let total_blocks = 4u32;
+
+                    launch!(
+                        func<<<4, 128, 0, self.stream>>>(
+                            queue_ptr,
+                            block_id,
+                            total_blocks
+                        )
+                    )?;
+                }
+            }
+            _ => {
+                // Single-block kernels: 1 block, 1 thread
+                unsafe {
+                    launch!(
+                        func<<<1, 1, 0, self.stream>>>(
+                            queue_ptr
+                        )
+                    )?;
+                }
+            }
         }
 
         self.kernel_running = true;
@@ -388,6 +426,74 @@ impl CudaClawExecutor {
         Ok(())
     }
 
+    /// Get worker statistics from the GPU
+    pub fn get_worker_stats(&self) -> Result<WorkerStats, Box<dyn std::error::Error>> {
+        let func = self.module.get_function(&CString::new("get_worker_stats")?)?;
+        let mut queue_ptr = self.queue.as_device_ptr();
+
+        // Allocate device buffer for stats
+        let mut stats_host = [0u64; 10];
+        let mut stats_device = DeviceBuffer::from_slice(&stats_host)?;
+
+        unsafe {
+            launch!(
+                func<<<1, 1, 0, self.stream>>>(
+                    queue_ptr,
+                    stats_device.as_device_ptr()
+                )
+            )?;
+        }
+
+        self.stream.synchronize()?;
+
+        // Copy stats back to host
+        stats_device.copy_to(&mut stats_host)?;
+
+        Ok(WorkerStats {
+            commands_processed: stats_host[0],
+            total_cycles: stats_host[1],
+            idle_cycles: stats_host[2],
+            head: stats_host[3] as u32,
+            tail: stats_host[4] as u32,
+            status: QueueStatus::from(stats_host[5] as u32),
+            current_strategy: PollingStrategy::from(stats_host[6] as u32),
+            consecutive_commands: stats_host[7] as u32,
+            consecutive_idle: stats_host[8] as u32,
+            avg_command_latency_cycles: stats_host[9],
+        })
+    }
+
+    /// Measure warp-level performance metrics
+    pub fn measure_warp_metrics(&self) -> Result<WarpMetrics, Box<dyn std::error::Error>> {
+        let func = self.module.get_function(&CString::new("measure_warp_metrics")?)?;
+        let mut queue_ptr = self.queue.as_device_ptr();
+
+        // Allocate device buffer for metrics
+        let mut metrics_host = [0u32; 4];
+        let mut metrics_device = DeviceBuffer::from_slice(&metrics_host)?;
+
+        unsafe {
+            launch!(
+                func<<<1, 1, 0, self.stream>>>(
+                    queue_ptr,
+                    metrics_device.as_device_ptr()
+                )
+            )?;
+        }
+
+        self.stream.synchronize()?;
+
+        // Copy metrics back to host
+        metrics_device.copy_to(&mut metrics_host)?;
+
+        Ok(WarpMetrics {
+            utilization_percent: metrics_host[0],
+            commands_processed: metrics_host[1],
+            consecutive_commands: metrics_host[2],
+            consecutive_idle: metrics_host[3],
+        })
+    }
+
     /// Get statistics from the queue
     pub fn get_stats(&self) -> ExecutorStats {
         let queue = self.queue.clone();
@@ -420,6 +526,30 @@ pub struct ExecutorStats {
     pub consecutive_commands: u32,
     pub consecutive_idle: u32,
     pub avg_command_latency_cycles: u64,
+}
+
+/// Worker statistics from the persistent worker kernel
+#[derive(Debug, Clone)]
+pub struct WorkerStats {
+    pub commands_processed: u64,
+    pub total_cycles: u64,
+    pub idle_cycles: u64,
+    pub head: u32,
+    pub tail: u32,
+    pub status: QueueStatus,
+    pub current_strategy: PollingStrategy,
+    pub consecutive_commands: u32,
+    pub consecutive_idle: u32,
+    pub avg_command_latency_cycles: u64,
+}
+
+/// Warp-level performance metrics
+#[derive(Debug, Clone)]
+pub struct WarpMetrics {
+    pub utilization_percent: u32,
+    pub commands_processed: u32,
+    pub consecutive_commands: u32,
+    pub consecutive_idle: u32,
 }
 
 impl From<u32> for PollingStrategy {

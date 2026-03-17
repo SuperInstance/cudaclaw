@@ -3,17 +3,11 @@
 // This kernel runs continuously on the GPU, processing commands from a queue in unified memory
 
 #include <cuda_runtime.h>
+#include "shared_types.h"  // Unified Memory Bridge - shared types with Rust
 
 // ============================================================
 // Configuration Constants
 // ============================================================
-
-// Polling strategies
-enum PollingStrategy : uint32_t {
-    POLL_SPIN = 0,         // Tight spin - lowest latency, highest power
-    POLL_ADAPTIVE = 1,     // Adaptive - balances latency and power
-    POLL_TIMED = 2,        // Fixed interval - lower power, higher latency
-};
 
 // Polling intervals (in clock cycles, approximate)
 // For reference: 1 GHz GPU = ~1 ns per cycle
@@ -25,91 +19,6 @@ enum PollingStrategy : uint32_t {
 // Adaptive polling thresholds
 #define IDLE_THRESHOLD         1000    // Cycles before switching to slower poll
 #define ACTIVITY_BURST         10      // Consecutive commands before fast poll
-
-// Status flags for the command queue
-enum QueueStatus : uint32_t {
-    STATUS_IDLE = 0,       // No command to process
-    STATUS_READY = 1,      // Command ready to process
-    STATUS_PROCESSING = 2, // Currently processing a command
-    STATUS_DONE = 3,       // Command processing complete
-    STATUS_ERROR = 4       // Error occurred
-};
-
-// Command types
-enum CommandType : uint32_t {
-    CMD_NO_OP = 0,        // No-operation - for latency testing
-    CMD_SHUTDOWN = 1,     // Shutdown the persistent kernel
-    CMD_ADD = 2,          // Add two numbers
-    CMD_MULTIPLY = 3,     // Multiply two numbers
-    CMD_BATCH_PROCESS = 4 // Batch process data
-};
-
-// ============================================================
-// Data Structures
-// ============================================================
-
-// Command structure (optimized for cache line alignment)
-struct __align__(32) Command {
-    CommandType type;     // Type of command to execute
-    uint32_t id;          // Unique command ID
-    uint64_t timestamp;   // Host timestamp when command was issued
-
-    // Command-specific data (union-like usage)
-    union {
-        struct {          // For CMD_NO_OP
-            uint32_t padding;
-        } noop;
-
-        struct {          // For CMD_ADD
-            float a;
-            float b;
-            float result;
-        } add;
-
-        struct {          // For CMD_MULTIPLY
-            float a;
-            float b;
-            float result;
-        } multiply;
-
-        struct {          // For CMD_BATCH_PROCESS
-            float* data;
-            uint32_t count;
-            float* output;
-        } batch;
-    } data;
-
-    uint32_t result_code; // Result code (0 = success)
-};
-
-// Command Queue in Unified Memory with adaptive polling
-struct __align__(128) CommandQueue {
-    volatile QueueStatus status;  // Current status (use volatile for GPU-CPU sync)
-
-    // Circular buffer for commands
-    static const uint32_t QUEUE_SIZE = 16;
-    Command commands[QUEUE_SIZE];
-
-    volatile uint32_t head;  // Index where host writes new commands
-    volatile uint32_t tail;  // Index where GPU reads commands
-
-    // Statistics
-    volatile uint64_t commands_processed;
-    volatile uint64_t total_cycles;
-    volatile uint64_t idle_cycles;
-
-    // Adaptive polling state
-    volatile PollingStrategy current_strategy;
-    volatile uint32_t consecutive_commands;
-    volatile uint32_t consecutive_idle;
-
-    // Performance metrics
-    volatile uint64_t last_command_cycle;
-    volatile uint64_t avg_command_latency_cycles;
-
-    // Padding to prevent false sharing and ensure cache line alignment
-    uint8_t padding[64];
-};
 
 // ============================================================
 // Device Functions - Polling Optimization
@@ -295,7 +204,7 @@ extern "C" __global__ void cuda_claw_executor(CommandQueue* queue) {
             ensure_visibility();  // Critical: Ensure CPU sees DONE status immediately
 
             // Move tail forward (circular buffer)
-            queue->tail = (queue->tail + 1) % CommandQueue::QUEUE_SIZE;
+            queue->tail = (queue->tail + 1) % QUEUE_SIZE;
 
             last_activity_cycle = cycle_count;
 
@@ -359,7 +268,7 @@ extern "C" __global__ void cuda_claw_executor_spin(CommandQueue* queue) {
             queue->status = STATUS_DONE;
             __threadfence_system();  // Double fence for maximum visibility
 
-            queue->tail = (queue->tail + 1) % CommandQueue::QUEUE_SIZE;
+            queue->tail = (queue->tail + 1) % QUEUE_SIZE;
 
             if (queue->commands[idx].type == CMD_SHUTDOWN) {
                 queue->total_cycles = cycle_count;
@@ -402,7 +311,7 @@ extern "C" __global__ void cuda_claw_executor_timed(CommandQueue* queue) {
             queue->status = STATUS_DONE;
             __threadfence_system();
 
-            queue->tail = (queue->tail + 1) % CommandQueue::QUEUE_SIZE;
+            queue->tail = (queue->tail + 1) % QUEUE_SIZE;
 
             if (queue->commands[idx].type == CMD_SHUTDOWN) {
                 queue->total_cycles = cycle_count;
@@ -437,7 +346,7 @@ extern "C" __global__ void init_command_queue(CommandQueue* queue) {
         queue->avg_command_latency_cycles = 0;
 
         // Initialize all commands to NO_OP
-        for (uint32_t i = 0; i < CommandQueue::QUEUE_SIZE; i++) {
+        for (uint32_t i = 0; i < QUEUE_SIZE; i++) {
             queue->commands[i].type = CMD_NO_OP;
             queue->commands[i].id = i;
             queue->commands[i].timestamp = 0;

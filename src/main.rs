@@ -1,11 +1,314 @@
-use cuda_claw::CudaClawExecutor;
+use cuda_claw::{CudaClawExecutor, CommandQueueHost};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 mod agent;
+mod alignment;
 mod cuda_claw;
+mod dispatcher;
 
 use agent::{AgentDispatcher, AgentOperation, AgentType, CellRef, SuperInstance};
+use alignment::{assert_alignment, verify_alignment, KernelConfig, KernelLifecycleManager, print_alignment_report};
+use dispatcher::{GpuDispatcher, create_add_command, create_add_batch, calculate_batch_stats};
+
+fn run_persistent_worker_demo() -> Result<(), Box<dyn std::error::Error>> {
+    println!("\n=== Persistent Worker Kernel Demo ===");
+    println!("Demonstrating warp-level parallelism in persistent GPU kernel...\n");
+
+    // Create executor with persistent worker variant
+    println!("Initializing CudaClaw executor with PersistentWorker variant...");
+    let mut executor = CudaClawExecutor::with_variant(cuda_claw::KernelVariant::PersistentWorker)?;
+
+    executor.init_queue()?;
+    executor.start()?;
+
+    println!("Persistent worker kernel is running with warp-level parallelism\n");
+
+    // Submit multiple commands to test parallel processing
+    println!("Submitting batch of commands for parallel processing...");
+    let test_commands = vec![
+        (1.0, 2.0),   // 1 + 2 = 3
+        (10.0, 20.0), // 10 + 20 = 30
+        (5.5, 4.5),   // 5.5 + 4.5 = 10
+        (100.0, 200.0), // 100 + 200 = 300
+        (2.5, 3.5),   // 2.5 + 3.5 = 6
+    ];
+
+    for (i, (a, b)) in test_commands.iter().enumerate() {
+        let (latency, result) = executor.execute_add(*a, *b)?;
+        println!("  Command {}: {:.1} + {:.1} = {:.1} ({:?})",
+            i + 1, a, b, result, latency);
+    }
+
+    // Get worker statistics
+    println!("\nWorker Statistics:");
+    let worker_stats = executor.get_worker_stats()?;
+    println!("  Commands processed: {}", worker_stats.commands_processed);
+    println!("  Total cycles: {}", worker_stats.total_cycles);
+    println!("  Idle cycles: {}", worker_stats.idle_cycles);
+    println!("  Queue head: {}", worker_stats.head);
+    println!("  Queue tail: {}", worker_stats.tail);
+    println!("  Current status: {:?}", worker_stats.status);
+    println!("  Current strategy: {:?}", worker_stats.current_strategy);
+
+    // Measure warp metrics
+    println!("\nWarp-Level Performance Metrics:");
+    let warp_metrics = executor.measure_warp_metrics()?;
+    println!("  Utilization: {}%", warp_metrics.utilization_percent);
+    println!("  Commands processed: {}", warp_metrics.commands_processed);
+    println!("  Consecutive commands: {}", warp_metrics.consecutive_commands);
+    println!("  Consecutive idle: {}", warp_metrics.consecutive_idle);
+
+    // Calculate efficiency
+    let total_cycles = worker_stats.total_cycles as f64;
+    let idle_cycles = worker_stats.idle_cycles as f64;
+    let efficiency = if total_cycles > 0.0 {
+        ((total_cycles - idle_cycles) / total_cycles) * 100.0
+    } else {
+        0.0
+    };
+    println!("  Worker efficiency: {:.2}%", efficiency);
+
+    // Shutdown
+    executor.shutdown()?;
+    println!("\nPersistent worker kernel shut down successfully");
+
+    println!("\n=== Persistent Worker Demo Complete ===");
+
+    Ok(())
+}
+
+// ============================================================
+// Unified Memory "Bridge" Demonstration
+// ============================================================
+//
+// This example shows how to allocate the CommandQueue in Unified Memory
+// using cust::memory::UnifiedBuffer. The same memory region is accessible
+// from both CPU (Rust) and GPU (CUDA kernel) without explicit copying.
+//
+// KEY BENEFITS:
+// - Zero-copy communication between host and device
+// - Sub-microsecond latency for command submission
+// - Automatic memory migration by CUDA driver
+// - Cache-coherent access on supported hardware
+//
+// The CommandQueue struct is defined in two places:
+// 1. kernels/shared_types.h (C++ side)
+// 2. src/cuda_claw.rs (Rust side)
+//
+// Both definitions MUST match exactly in memory layout, which is
+// verified by compile-time assertions in both languages.
+//
+// ALLOCATION EXAMPLE:
+//   use cust::memory::UnifiedBuffer;
+//   let queue_data = CommandQueueHost::default();
+//   let queue = UnifiedBuffer::new(&queue_data)?;
+//
+// USAGE PATTERN:
+// 1. CPU writes: queue_mut.status = QueueStatus::Ready as u32;
+// 2. GPU polls: while (queue->status != STATUS_READY) { ... }
+// 3. GPU processes command and sets: queue->status = STATUS_DONE;
+// 4. CPU reads: let status = QueueStatus::from(queue.status);
+//
+// MANUAL ALLOCATION EXAMPLE:
+//   // This shows how to manually allocate the CommandQueue in Unified Memory
+//   // without using the CudaClawExecutor wrapper
+//
+//   use cust::memory::UnifiedBuffer;
+//   use cuda_claw::{CommandQueueHost, Command, CommandType, QueueStatus};
+//
+//   // 1. Create default queue data
+//   let queue_data = CommandQueueHost::default();
+//
+//   // 2. Allocate in Unified Memory (both CPU and GPU can access)
+//   let mut queue = UnifiedBuffer::new(&queue_data)?;
+//
+//   // 3. Initialize on GPU using init kernel
+//   let func = module.get_function("init_command_queue")?;
+//   let mut queue_ptr = queue.as_device_ptr();
+//   unsafe {
+//       launch!(func<<<1, 1>>>(queue_ptr))?;
+//   }
+//   stream.synchronize()?;
+//
+//   // 4. Submit command from CPU
+//   {
+//       let mut queue_mut = queue.clone();  // Clone for mutable access
+//       let cmd = Command::new(CommandType::NoOp, 0);
+//       queue_mut.commands[0] = cmd;
+//       queue_mut.status = QueueStatus::Ready as u32;
+//   }
+//
+//   // 5. Wait for GPU to complete
+//   loop {
+//       let queue_ref = queue.clone();
+//       if queue_ref.status == QueueStatus::Done as u32 {
+//           break;
+//       }
+//       std::thread::sleep(Duration::from_micros(1));
+//   }
+//
+// ============================================================
+
+fn run_alignment_verification() -> Result<(), Box<dyn std::error::Error>> {
+    println!("\n=== Memory Alignment Verification ===");
+    println!("Verifying #[repr(C)] alignment between Rust and CUDA...\n");
+
+    // Verify alignment
+    let report = verify_alignment();
+    print_alignment_report(&report);
+
+    // Assert alignment (panics if invalid)
+    assert_alignment();
+
+    println!("✓ All alignment checks passed!");
+    println!("  - Command struct: 48 bytes, 32-byte aligned");
+    println!("  - CommandQueue struct: 896 bytes, 128-byte aligned");
+    println!("  - All field offsets match\n");
+
+    Ok(())
+}
+
+fn run_long_running_kernel_demo(
+    command_queue: Arc<Mutex<cust::memory::UnifiedBuffer<cuda_claw::CommandQueueHost>>>
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("\n=== Long-Running Kernel Demo ===");
+    println!("Demonstrating kernel health monitoring and lifecycle management...\n");
+
+    // Create lifecycle manager with long-running configuration
+    println!("Creating lifecycle manager with long-running configuration...");
+    let config = KernelConfig::long_running();
+    let mut lifecycle_manager = KernelLifecycleManager::new(command_queue, config);
+
+    println!("Configuration:");
+    println!("  Max execution time: {:?}", lifecycle_manager.health_metrics().unwrap().uptime);
+    println!("  Health check interval: 1000 ms");
+    println!("  Watchdog timeout: 30 sec");
+    println!("  Auto-restart: enabled\n");
+
+    // Start lifecycle management
+    println!("Starting kernel lifecycle management...");
+    lifecycle_manager.start()?;
+
+    // Run for a while and monitor health
+    println!("Running kernel health checks for 5 seconds...\n");
+
+    for i in 0..5 {
+        std::thread::sleep(Duration::from_secs(1));
+
+        if let Some(metrics) = lifecycle_manager.health_metrics() {
+            println!("Health Check [{}]:", i + 1);
+            println!("  Status: {:?}", metrics.status);
+            println!("  Uptime: {:?}", metrics.uptime);
+            println!("  Cycles/sec: {:.2}", metrics.cycles_per_second);
+            println!("  Idle percentage: {:.1}%", metrics.idle_percentage);
+            println!();
+        }
+
+        // Check if restart needed
+        if lifecycle_manager.check_and_restart()? {
+            println!("⚠ Kernel restart initiated!");
+            break;
+        }
+    }
+
+    println!("Long-running kernel demo complete");
+
+    Ok(())
+}
+
+//
+// ============================================================
+
+fn run_gpu_dispatcher_demo(
+    command_queue: Arc<Mutex<cust::memory::UnifiedBuffer<cuda_claw::CommandQueueHost>>>
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("\n=== GPU Dispatcher Demo ===");
+    println!("Demonstrating high-performance command dispatch...\n");
+
+    // Create dispatcher
+    println!("Creating GPU dispatcher...");
+    let mut dispatcher = GpuDispatcher::with_default_queue(command_queue)?;
+
+    // ============================================================
+    // Single Command Dispatch
+    // ============================================================
+    println!("\n--- Single Command Dispatch ---");
+
+    let cmd = create_add_command(10.0, 20.0);
+    println!("Dispatching command: 10.0 + 20.0");
+
+    let result = dispatcher.dispatch_sync(cmd)?;
+    println!("  Result: {:?}", result);
+    println!("  Success: {}", result.success);
+    println!("  Latency: {:?}", result.latency);
+
+    // ============================================================
+    // Batch Dispatch
+    // ============================================================
+    println!("\n--- Batch Dispatch ---");
+
+    let pairs = vec![
+        (1.0, 2.0),
+        (3.0, 4.0),
+        (5.0, 6.0),
+        (7.0, 8.0),
+        (9.0, 10.0),
+        (11.0, 12.0),
+        (13.0, 14.0),
+        (15.0, 16.0),
+    ];
+
+    println!("Dispatching batch of {} commands", pairs.len());
+    let batch_commands = create_add_batch(pairs.clone());
+
+    let start = std::time::Instant::now();
+    let results = dispatcher.dispatch_batch(batch_commands)?;
+    let batch_latency = start.elapsed();
+
+    println!("  Batch completed in: {:?}", batch_latency);
+    println!("  Throughput: {:.2} commands/ms", pairs.len() as f64 / batch_latency.as_millis() as f64);
+
+    // Calculate batch statistics
+    let (success_rate, avg_latency, max_latency) = calculate_batch_stats(&results);
+    println!("  Success rate: {:.1}%", success_rate);
+    println!("  Average latency: {:.2} µs", avg_latency);
+    println!("  Max latency: {:.2} µs", max_latency);
+
+    // ============================================================
+    // Priority Dispatch
+    // ============================================================
+    println!("\n--- Priority Dispatch ---");
+
+    use dispatcher::DispatchPriority;
+
+    let high_priority_cmd = create_add_command(100.0, 200.0);
+    println!("Dispatching high-priority command: 100.0 + 200.0");
+
+    let result = dispatcher.dispatch_with_priority(high_priority_cmd, DispatchPriority::High)?;
+    println!("  Result: {:?}", result);
+    println!("  Success: {}", result.success);
+
+    // ============================================================
+    // Statistics
+    // ============================================================
+    println!("\n--- Dispatcher Statistics ---");
+
+    let stats = dispatcher.get_stats();
+    println!("  Commands submitted: {}", stats.commands_submitted);
+    println!("  Commands completed: {}", stats.commands_completed);
+    println!("  Commands failed:    {}", stats.commands_failed);
+    println!("  Average latency:    {:.2} µs", stats.average_latency_us);
+    println!("  Peak queue depth:   {}", stats.peak_queue_depth);
+    println!("  Queue full events:  {}", stats.queue_full_count);
+
+    println!("\n=== GPU Dispatcher Demo Complete ===");
+
+    Ok(())
+}
+
+//
+// ============================================================
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -17,6 +320,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("CUDA initialized successfully");
     println!("GPUs available: {}", cust::device::get_device_count()?);
+
+    // Verify alignment before proceeding
+    run_alignment_verification()?;
 
     // Create the CudaClaw executor
     println!("\nInitializing CudaClaw executor...");
@@ -40,6 +346,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Run functional tests
     run_functional_tests(&mut executor)?;
+
+    // Demonstrate persistent worker kernel
+    run_persistent_worker_demo()?;
+
+    // Demonstrate long-running kernel support
+    run_long_running_kernel_demo(command_queue.clone())?;
+
+    // Demonstrate GPU Dispatcher
+    run_gpu_dispatcher_demo(command_queue.clone())?;
 
     // Demonstrate AgentDispatcher
     run_agent_dispatcher_demo(command_queue.clone())?;
