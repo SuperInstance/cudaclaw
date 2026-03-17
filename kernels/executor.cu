@@ -452,171 +452,236 @@ __device__ __forceinline__ void apply_polling_delay(CommandQueue* queue) {
 }
 
 // ============================================================
-// Main Persistent Worker Kernel (Refactored)
+// Simplified Persistent Kernel - Direct Queue Polling
 // ============================================================
 
 /**
- * Persistent worker kernel that continuously processes commands from the queue.
+ * Simple persistent kernel that continuously polls the command queue.
  *
- * ARCHITECTURE:
- * - Thread 0 of each block manages the queue (checks for work, pops commands)
- * - Other threads wait for work signal via shared memory
- * - When work is available, warps process commands in parallel
- * - Uses __nanosleep() for efficient idle waiting
- * - Lock-free queue operations for thread-safe access
+ * DESIGN PRINCIPLES:
+ * - Direct tail/head polling without complex state management
+ * - Single thread per block for queue management to avoid contention
+ * - __threadfence_system() ensures PCIe memory visibility
+ * - __nanosleep() prevents SM burnout during idle periods
  *
  * THREAD ORGANIZATION:
- * - Block manager: Thread 0 (handles queue)
- * - Warp 0: Threads 0-31 (processes command 0)
- * - Warp 1: Threads 32-63 (processes command 1)
- * - etc.
+ * - Thread 0 of each block: Manages queue and processes commands
+ * - Other threads: Available for parallel processing within commands
  *
  * LAUNCH CONFIGURATION:
- * - Blocks: 1-8 (depending on workload)
- * - Threads: 32-256 per block (must be multiple of 32)
+ * - Blocks: 1 (single block avoids queue contention)
+ * - Threads: 32-256 (must be multiple of 32 for warp operations)
  *
  * @param queue Pointer to CommandQueue in unified memory
- * @param running_flag External pointer to running flag (can be nullptr)
+ * @param running_flag External running flag (set to false to shutdown)
  */
-extern "C" __global__ void persistent_worker(
+extern "C" __global__ void persistent_worker_simple(
     CommandQueue* queue,
     volatile bool* running_flag
 ) {
-    // Initialize worker context
-    WorkerContext ctx;
-
-    // Calculate thread IDs
-    ctx.thread_id = blockIdx.x * blockDim.x + threadIdx.x;
-    ctx.warp_id = threadIdx.x / WARP_SIZE;  // Warp ID within block
-    ctx.lane_id = threadIdx.x % WARP_SIZE;   // Lane ID within warp (0-31)
-    ctx.is_leader = (ctx.lane_id == 0);
-    ctx.is_block_leader = (threadIdx.x == 0);  // Only thread 0 manages queue
-
-    ctx.assigned_cmd = 0;
-    ctx.task_type = 0;
-    ctx.workload_size = 0;
-    ctx.tasks_processed = 0;
-    ctx.total_cycles = 0;
-
-    // Get the number of warps in this block
-    __shared__ uint32_t warp_count;
-    if (ctx.is_block_leader) {
-        warp_count = blockDim.x / WARP_SIZE;
+    // Only thread 0 of block 0 manages the queue
+    // This prevents multiple threads from contending for queue access
+    if (blockIdx.x != 0 || threadIdx.x != 0) {
+        return;  // Other threads exit immediately
     }
-    __syncthreads();
 
-    // Shared work signal for block coordination
-    __shared__ WorkSignal work_signal;
+    // Initialize queue statistics
+    queue->commands_processed = 0;
+    queue->total_cycles = 0;
+    queue->idle_cycles = 0;
+    queue->status = STATUS_PROCESSING;
 
-    // Initialize work signal
-    if (ctx.is_block_leader) {
-        work_signal.has_work = 0;
-        work_signal.cmd_count = 0;
-        work_signal.shutdown = 0;
+    printf("[GPU] Persistent kernel started. Queue at %p\n", queue);
 
-        // Initialize queue state (only first block, first time)
-        if (blockIdx.x == 0) {
-            queue->current_strategy = POLL_ADAPTIVE;
-            queue->consecutive_commands = 0;
-            queue->consecutive_idle = 0;
-            queue->commands_processed = 0;
-            queue->total_cycles = 0;
-            queue->idle_cycles = 0;
-        }
-    }
-    __syncthreads();
+    // ============================================================
+    // MAIN PERSISTENT LOOP
+    // ============================================================
+    // Continue until external running flag is set to false
+    // Check running_flag first (fast path), then check for shutdown command
+    while (running_flag != nullptr && *running_flag) {
 
-    // Persistent worker loop
-    uint64_t cycle_count = 0;
-    bool should_exit = false;
-
-    while (!should_exit) {
-        cycle_count++;
-
-        // Ensure we see the latest queue state from CPU
+        // ============================================================
+        // MEMORY FENCE FOR PCIe VISIBILITY
+        // ============================================================
+        // __threadfence_system() ensures that:
+        // 1. All previous memory operations are visible to CPU
+        // 2. We see the latest queue->head written by CPU
+        // 3. Stronger than __threadfence() - works across PCIe bus
         __threadfence_system();
 
         // ============================================================
-        // PHASE 1: Queue Management (Thread 0 only)
+        // POLL TAIL INDEX
         // ============================================================
-
-        // Block leader manages the queue and signals other threads
-        __syncthreads();  // Ensure work_signal is initialized
-
-        bool continue_running = manage_queue(queue, &work_signal, running_flag);
-
-        // Broadcast shutdown signal to all threads
-        should_exit = (work_signal.shutdown != 0);
-
-        if (should_exit || !continue_running) {
-            break;  // Exit the persistent loop
-        }
-
-        __syncthreads();  // Ensure all threads see the work signal
+        // Read volatile head and tail indices
+        // head: write index (updated by CPU/Rust)
+        // tail: read index (updated by GPU kernel)
+        uint32_t head = queue->head;
+        uint32_t tail = queue->tail;
 
         // ============================================================
-        // PHASE 2: Work Processing (All threads)
+        // CHECK IF QUEUE HAS COMMANDS
         // ============================================================
+        if (head != tail) {
+            // Queue has commands - process one
 
-        if (work_signal.has_work) {
-            // Work is available - process it
+            // Calculate index in circular buffer
+            uint32_t cmd_idx = tail % QUEUE_SIZE;
+            Command* cmd = &queue->commands[cmd_idx];
+
+            printf("[GPU] Processing command %u at tail=%u head=%u\n",
+                   cmd->id, tail, head);
+
+            // ============================================================
+            // PROCESS COMMAND BASED ON TYPE
+            // ============================================================
+            switch (cmd->type) {
+                case CMD_NO_OP:
+                    // No-operation - just acknowledge
+                    cmd->result_code = 0;
+                    break;
+
+                case CMD_ADD: {
+                    // Simple addition
+                    cmd->data.add.result = cmd->data.add.a + cmd->data.add.b;
+                    cmd->result_code = 0;
+                    printf("[GPU] ADD: %.2f + %.2f = %.2f\n",
+                           cmd->data.add.a, cmd->data.add.b, cmd->data.add.result);
+                    break;
+                }
+
+                case CMD_MULTIPLY: {
+                    // Simple multiplication
+                    cmd->data.multiply.result =
+                        cmd->data.multiply.a * cmd->data.multiply.b;
+                    cmd->result_code = 0;
+                    printf("[GPU] MULTIPLY: %.2f * %.2f = %.2f\n",
+                           cmd->data.multiply.a, cmd->data.multiply.b,
+                           cmd->data.multiply.result);
+                    break;
+                }
+
+                case CMD_BATCH_PROCESS: {
+                    // Batch processing - apply transformation to array
+                    float* data = cmd->data.batch.data;
+                    uint32_t count = cmd->data.batch.count;
+                    float* output = cmd->data.batch.output;
+
+                    if (data != nullptr && output != nullptr && count > 0) {
+                        // Process entire array (single thread for simplicity)
+                        for (uint32_t i = 0; i < count; i++) {
+                            output[i] = data[i] * 2.0f;  // Example: multiply by 2
+                        }
+                        cmd->result_code = 0;
+                        printf("[GPU] BATCH: Processed %u elements\n", count);
+                    } else {
+                        cmd->result_code = 1;  // Error: null pointers
+                        printf("[GPU] BATCH ERROR: Invalid pointers\n");
+                    }
+                    break;
+                }
+
+                case CMD_SPREADSHEET_EDIT: {
+                    // ============================================================
+                    // SMARTCRDT MERGE LOGIC
+                    // ============================================================
+                    // This is where GPU-accelerated CRDT merge happens
+                    SpreadsheetCell* cells =
+                        (SpreadsheetCell*)cmd->data.spreadsheet.cells_ptr;
+                    const SpreadsheetEdit* edit =
+                        (const SpreadsheetEdit*)cmd->data.spreadsheet.edit_ptr;
+
+                    if (cells != nullptr && edit != nullptr) {
+                        // Calculate cell index
+                        uint32_t cell_idx = get_coalesced_cell_index(
+                            edit->cell_id.row,
+                            edit->cell_id.col,
+                            MAX_COLS
+                        );
+
+                        printf("[GPU] SPREADSHEET_EDIT: cell[%u][%u] idx=%u\n",
+                               edit->cell_id.row, edit->cell_id.col, cell_idx);
+
+                        // Apply atomic CRDT update
+                        bool success = atomic_update_cell(&cells[cell_idx], *edit);
+
+                        cmd->result_code = success ? 0 : 1;
+                        printf("[GPU] SmartCRDT merge: %s\n",
+                               success ? "SUCCESS" : "FAILED");
+                    } else {
+                        cmd->result_code = 2;  // Error: null pointers
+                        printf("[GPU] SPREADSHEET_EDIT ERROR: Invalid pointers\n");
+                    }
+                    break;
+                }
+
+                case CMD_SHUTDOWN:
+                    // Shutdown command - signal exit
+                    printf("[GPU] Received SHUTDOWN command\n");
+                    cmd->result_code = 0;
+                    queue->status = STATUS_DONE;
+
+                    // Update running flag to signal other threads
+                    if (running_flag != nullptr) {
+                        *running_flag = false;
+                    }
+                    break;
+
+                default:
+                    cmd->result_code = 0xFFFFFFFF;  // Unknown command
+                    printf("[GPU] Unknown command type: %u\n", cmd->type);
+                    break;
+            }
+
+            // ============================================================
+            // ADVANCE TAIL (POP COMMAND)
+            // ============================================================
+            // Move tail forward to indicate command is processed
+            tail = (tail + 1) % QUEUE_SIZE;
+            queue->tail = tail;
 
             // Update statistics
-            if (ctx.is_block_leader) {
-                atomicAdd((unsigned long long*)&queue->commands_processed,
-                          work_signal.cmd_count);
-            }
+            queue->commands_processed++;
+            queue->commands_popped++;
 
-            // Process commands in parallel (one per warp)
-            process_commands_parallel(queue, &ctx, work_signal.cmd_count);
-
-            // Advance tail for processed commands
-            if (ctx.is_block_leader) {
-                uint32_t processed = work_signal.cmd_count;
-                uint32_t new_tail = (queue->tail + processed) % QUEUE_SIZE;
-                queue->tail = new_tail;
-
-                // Reset cycle count after work
-                cycle_count = 0;
-            }
-
-            // Update per-warp statistics
-            ctx.total_cycles += cycle_count;
+            // Ensure all writes are visible to CPU before next iteration
+            __threadfence_system();
 
         } else {
             // ============================================================
-            // PHASE 3: Idle Waiting (All threads)
+            // QUEUE EMPTY - IDLE WAITING
             // ============================================================
+            // No commands to process - yield to prevent SM burnout
+            // Use __nanosleep() instead of busy-waiting
 
-            // Update idle statistics
-            if (ctx.is_block_leader) {
-                atomicAdd((unsigned long long*)&queue->total_cycles, 1);
-                atomicAdd((unsigned long long*)&queue->idle_cycles, 1);
-            }
+            queue->idle_cycles++;
 
-            // Apply adaptive polling delay using __nanosleep
-            // This prevents SM saturation while maintaining low latency
-            if (ctx.is_leader) {
-                apply_polling_delay(queue);
-            }
-
-            // Synchronize warp to ensure all lanes are ready
-            __syncwarp();
+            #if __CUDA_ARCH__ >= 700
+                // Pascal and newer: use nanosleep for efficient waiting
+                // 1000 nanoseconds = 1 microsecond
+                // This prevents burning SM cycles while maintaining low latency
+                __nanosleep(1000);
+            #else
+                // Older architectures: use minimal sleep
+                // Spin for a few cycles to yield
+                for (volatile int i = 0; i < 100; i++) {
+                    __threadfence_block();
+                }
+            #endif
         }
 
-        // Periodic state update (every 1024 cycles)
-        if ((cycle_count & 1023) == 0 && ctx.is_block_leader) {
-            queue->total_cycles += cycle_count;
-        }
-
-        __syncthreads();  // Synchronize block before next iteration
+        // Update total cycle count
+        queue->total_cycles++;
     }
 
-    // Kernel shutdown - update final statistics
-    if (ctx.is_block_leader) {
-        queue->total_cycles += cycle_count;
-        queue->status = STATUS_IDLE;
-    }
+    // ============================================================
+    // KERNEL SHUTDOWN
+    // ============================================================
+    printf("[GPU] Persistent kernel shutting down...\n");
+    printf("[GPU] Final stats: processed=%llu, cycles=%llu, idle=%llu\n",
+           queue->commands_processed, queue->total_cycles, queue->idle_cycles);
+
+    queue->status = STATUS_IDLE;
+    __threadfence_system();  // Ensure final state is visible to CPU
 }
 
 // ============================================================

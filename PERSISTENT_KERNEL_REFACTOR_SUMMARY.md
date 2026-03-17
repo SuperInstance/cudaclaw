@@ -1,12 +1,72 @@
-# Persistent Kernel Refactoring - Complete Summary
+# Persistent Kernel Refactoring - Simplified Direct Polling
 
 ## Overview
 
-This document summarizes the refactoring of `kernels/executor.cu` into a modern persistent worker kernel pattern with lock-free queue operations, external running flag control, and efficient idle waiting using `__nanosleep()`.
+Refactored `kernels/executor.cu` from a complex multi-phase persistent kernel to a simplified, direct polling approach. The new implementation uses a clean `while(running_flag)` loop with direct tail/head polling and `__threadfence_system()` for PCIe memory visibility.
 
-## Key Changes
+## Architecture Simplification
 
-### 1. External Running Flag
+### Before: Complex Multi-Phase Design
+- **3-phase architecture**: Queue Management → Work Processing → Idle Waiting
+- **Complex state**: WorkSignal structures, worker contexts, adaptive polling
+- **~200 lines** of synchronization logic
+- Multiple polling strategies (SPIN, ADAPTIVE, TIMED)
+
+### After: Simple Direct Polling
+- **Single-phase design**: Direct tail/head polling in while loop
+- **Minimal state**: Simple boolean running flag
+- **~50 lines** of straightforward logic
+- Fixed polling with `__nanosleep(1000)`
+
+## New Kernel: `persistent_worker_simple()`
+
+### Key Features
+
+1. **Direct Queue Polling**:
+   ```cpp
+   uint32_t head = queue->head;  // Read by CPU (Rust)
+   uint32_t tail = queue->tail;  // Written by GPU
+
+   if (head != tail) {
+       // Process command at tail position
+   }
+   ```
+
+2. **PCIe Memory Visibility**:
+   ```cpp
+   __threadfence_system();  // Before reading queue
+   // ... process command ...
+   __threadfence_system();  // After writing queue
+   ```
+
+3. **Efficient Idle Waiting**:
+   ```cpp
+   if (head != tail) {
+       // Process command
+   } else {
+       __nanosleep(1000);  // 1 microsecond to prevent SM burnout
+   }
+   ```
+
+4. **SmartCRDT Integration**:
+   ```cpp
+   case CMD_SPREADSHEET_EDIT: {
+       SpreadsheetCell* cells = (SpreadsheetCell*)cmd->data.spreadsheet.cells_ptr;
+       const SpreadsheetEdit* edit = (const SpreadsheetEdit*)cmd->data.spreadsheet.edit_ptr;
+
+       uint32_t cell_idx = get_coalesced_cell_index(
+           edit->cell_id.row,
+           edit->cell_id.col,
+           MAX_COLS
+       );
+
+       bool success = atomic_update_cell(&cells[cell_idx], *edit);
+       cmd->result_code = success ? 0 : 1;
+       break;
+   }
+   ```
+
+## Complete Kernel Implementation
 
 **Before:**
 ```cpp
