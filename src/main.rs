@@ -1,6 +1,6 @@
 use cuda_claw::{CudaClawExecutor, CommandQueueHost, Command, CommandType};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // Terminal color codes for output
 mod colors {
@@ -22,6 +22,7 @@ mod alignment;
 mod bridge;
 mod cuda_claw;
 mod dispatcher;
+mod gpu_metrics;
 mod lock_free_queue;
 mod monitor;
 mod volatile_dispatcher;
@@ -30,6 +31,7 @@ use agent::{AgentDispatcher, AgentOperation, AgentType, CellRef, SuperInstance};
 use alignment::{assert_alignment, verify_alignment, KernelConfig, KernelLifecycleManager, print_alignment_report};
 use bridge::{GpuBridge, allocate_command_queue};
 use dispatcher::{GpuDispatcher, create_add_command, create_add_batch, calculate_batch_stats, SpinLockDispatcher, BenchmarkConfig, create_noop_command, create_noop_batch};
+use gpu_metrics::{GpuMetricsCollector, HighResolutionTimer, LatencyStats};
 use lock_free_queue::LockFreeCommandQueue;
 use monitor::{SuperInstanceMonitor, quick_demo};
 use volatile_dispatcher::{VolatileDispatcher, RoundTripBenchmark};
@@ -947,11 +949,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     executor.shutdown()?;
 
     // ============================================================
+    // DEMO 3: P99 Cell-Edit Latency Benchmark + GPU Metrics
+    // ============================================================
+    // Pushes 1,000,000 random cell edits through the CommandQueue,
+    // calculates P99 latency, logs GPU thermal/occupancy metrics,
+    // and writes latency_report.json.
+
+    run_p99_cell_edit_benchmark()?;
+
+    // ============================================================
     // Additional demos (commented out for clarity)
     // ============================================================
     // Uncomment to run additional demonstrations:
 
-    // DEMO 3: Persistent Kernel with Non-Blocking Command Submission
+    // DEMO 4: Persistent Kernel with Non-Blocking Command Submission
     // run_persistent_kernel_demo()?;
 
     // Demonstrate GPU Bridge (Unified Memory Allocator)
@@ -1483,6 +1494,262 @@ fn run_monitor_quick_demo() -> Result<(), Box<dyn std::error::Error>> {
     println!("Running 20 update cycles of live monitoring...\n");
 
     quick_demo()?;
+
+    Ok(())
+}
+
+// ============================================================
+// P99 Cell-Edit Latency Benchmark
+// ============================================================
+//
+// Pushes 1,000,000 random cell edits through the CommandQueue
+// (host-side lock-free ring buffer), measures per-push latency
+// with nanosecond precision, calculates P99, and writes
+// latency_report.json.
+//
+// GPU occupancy and thermal metrics are collected via
+// GpuMetricsCollector (NVML when available, simulated otherwise)
+// to verify that hot-polling is not causing hardware throttling.
+// ============================================================
+
+/// Run the P99 cell-edit latency benchmark.
+///
+/// This function:
+/// 1. Allocates a `CommandQueueHost` in plain host memory (no CUDA
+///    required) so the benchmark runs even without a GPU.
+/// 2. Pushes 1,000,000 random `CellEdit` commands through the
+///    lock-free ring buffer, timing each push with a
+///    `HighResolutionTimer`.
+/// 3. Collects GPU thermal/occupancy snapshots every 50,000 edits.
+/// 4. Computes full latency statistics (min, max, mean, P50, P90,
+///    P95, P99, P99.9).
+/// 5. Writes `latency_report.json` to the current working directory.
+fn run_p99_cell_edit_benchmark() -> Result<(), Box<dyn std::error::Error>> {
+    use rand::Rng;
+    use std::mem::zeroed;
+
+    println!("\n{}", "=".repeat(60));
+    println!("  P99 Cell-Edit Latency Benchmark");
+    println!("{}", "=".repeat(60));
+    println!("  Target  : 1,000,000 random cell edits");
+    println!("  Metric  : push latency (nanoseconds, host-side)");
+    println!("  Output  : latency_report.json");
+    println!("{}\n", "=".repeat(60));
+
+    const TOTAL_EDITS: usize = 1_000_000;
+    const WARMUP_EDITS: usize = 10_000;
+    const GPU_SAMPLE_INTERVAL: usize = 50_000;
+
+    // --------------------------------------------------------
+    // 1. Allocate CommandQueue in host memory
+    // --------------------------------------------------------
+    // We use a plain zeroed CommandQueueHost so the benchmark
+    // works without a live CUDA context.  The lock-free push
+    // logic is identical to the unified-memory path.
+    let mut queue: CommandQueueHost = unsafe { zeroed() };
+
+    // --------------------------------------------------------
+    // 2. Start GPU metrics collector
+    // --------------------------------------------------------
+    let mut gpu = GpuMetricsCollector::new(0);
+    let initial_snap = gpu.collect();
+    println!("[GPU] Initial state: {}", initial_snap.summary());
+
+    // --------------------------------------------------------
+    // 3. High-resolution timer for overall benchmark
+    // --------------------------------------------------------
+    let mut bench_timer = HighResolutionTimer::new("p99_cell_edit_benchmark");
+    let mut push_timer  = HighResolutionTimer::new("push_latency");
+
+    // --------------------------------------------------------
+    // 4. Warmup phase
+    // --------------------------------------------------------
+    println!("Warming up ({} edits)...", WARMUP_EDITS);
+    let mut rng = rand::thread_rng();
+
+    for i in 0..WARMUP_EDITS {
+        let cmd = Command {
+            cmd_type: CommandType::SpreadsheetEdit as u32,
+            id: (i % u32::MAX as usize) as u32,
+            timestamp: Instant::now().elapsed().as_nanos() as u64,
+            data_a: rng.gen_range(0.0_f32..1_000_000.0),
+            data_b: rng.gen_range(0.0_f32..1_000_000.0),
+            result: 0.0,
+            batch_data: rng.gen::<u64>(),
+            batch_count: 1,
+            _padding: 0,
+            result_code: 0,
+        };
+
+        // Drain the queue when full (simulate consumer)
+        if LockFreeCommandQueue::is_queue_full(&queue) {
+            LockFreeCommandQueue::reset_queue(&mut queue);
+        }
+        LockFreeCommandQueue::push_command(&mut queue, cmd);
+    }
+
+    // Reset queue and stats after warmup
+    LockFreeCommandQueue::reset_queue(&mut queue);
+    println!("Warmup complete.\n");
+
+    // --------------------------------------------------------
+    // 5. Main benchmark loop
+    // --------------------------------------------------------
+    println!("Starting benchmark ({} edits)...", TOTAL_EDITS);
+
+    let mut push_latencies_ns: Vec<u64> = Vec::with_capacity(TOTAL_EDITS);
+    let mut failed_pushes: u64 = 0;
+    let mut gpu_snapshots_during_bench = Vec::new();
+
+    bench_timer.start();
+
+    for i in 0..TOTAL_EDITS {
+        // Collect GPU metrics periodically
+        if i % GPU_SAMPLE_INTERVAL == 0 && i > 0 {
+            let snap = gpu.collect();
+            let pct = (i * 100) / TOTAL_EDITS;
+            println!(
+                "  [{:>3}%] edit {:>9} | GPU: {}",
+                pct, i, snap.summary()
+            );
+            if snap.is_throttled() {
+                println!("  WARNING: GPU throttling detected at edit {}!", i);
+            }
+            gpu_snapshots_during_bench.push(snap);
+        }
+
+        // Build a random cell-edit command
+        let cmd = Command {
+            cmd_type: CommandType::SpreadsheetEdit as u32,
+            id: (i % u32::MAX as usize) as u32,
+            timestamp: i as u64,
+            data_a: rng.gen_range(0.0_f32..1_000_000.0),
+            data_b: rng.gen_range(0.0_f32..1_000_000.0),
+            result: 0.0,
+            batch_data: rng.gen::<u64>(),
+            batch_count: 1,
+            _padding: 0,
+            result_code: 0,
+        };
+
+        // Drain queue when full (simulate GPU consumer)
+        if LockFreeCommandQueue::is_queue_full(&queue) {
+            LockFreeCommandQueue::reset_queue(&mut queue);
+        }
+
+        // Time the push
+        push_timer.start();
+        let pushed = LockFreeCommandQueue::push_command(&mut queue, cmd);
+        let elapsed_ns = push_timer.stop_ns();
+
+        if pushed {
+            push_latencies_ns.push(elapsed_ns);
+        } else {
+            failed_pushes += 1;
+        }
+    }
+
+    let bench_elapsed_ns = bench_timer.stop_ns();
+    let bench_elapsed_secs = bench_elapsed_ns as f64 / 1_000_000_000.0;
+
+    // Final GPU snapshot
+    let final_snap = gpu.collect();
+    println!("\n[GPU] Final state: {}", final_snap.summary());
+
+    // --------------------------------------------------------
+    // 6. Compute latency statistics
+    // --------------------------------------------------------
+    println!("\nComputing latency statistics...");
+
+    push_latencies_ns.sort_unstable();
+    let stats = LatencyStats::from_sorted_ns(&push_latencies_ns);
+    stats.print_table("CommandQueue Push");
+
+    let throughput = push_latencies_ns.len() as f64 / bench_elapsed_secs;
+    println!("\nThroughput : {:.2} million edits/sec", throughput / 1_000_000.0);
+    println!("Total time : {:.3} seconds", bench_elapsed_secs);
+    println!("Failed     : {} pushes (queue-full, drained by simulated consumer)", failed_pushes);
+
+    // --------------------------------------------------------
+    // 7. GPU metrics summary
+    // --------------------------------------------------------
+    gpu.print_summary();
+
+    // --------------------------------------------------------
+    // 8. Write latency_report.json
+    // --------------------------------------------------------
+    println!("Writing latency_report.json...");
+
+    let throttling_detected = gpu.snapshots().iter().any(|s| s.is_throttled());
+    let mut notes: Vec<String> = Vec::new();
+
+    if failed_pushes > 0 {
+        notes.push(format!(
+            "{} pushes failed (queue full); consumer drain was simulated by resetting head/tail",
+            failed_pushes
+        ));
+    }
+    if throttling_detected {
+        notes.push("GPU thermal/power throttling was detected during the benchmark. \
+                    Consider reducing hot-polling frequency or adding sleep intervals.".to_string());
+    } else {
+        notes.push("No GPU throttling detected. Hot-polling appears safe at this workload.".to_string());
+    }
+    notes.push(format!(
+        "Benchmark ran {} warmup edits followed by {} measured edits.",
+        WARMUP_EDITS, TOTAL_EDITS
+    ));
+
+    let report = serde_json::json!({
+        "schema_version": "1.0",
+        "generated_at_unix_secs": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        "benchmark": {
+            "name": "P99 Cell-Edit Latency Benchmark",
+            "total_cell_edits": TOTAL_EDITS,
+            "warmup_edits": WARMUP_EDITS,
+            "failed_pushes": failed_pushes,
+            "benchmark_duration_secs": bench_elapsed_secs,
+            "throughput_edits_per_sec": throughput,
+        },
+        "push_latency_ns": {
+            "samples": stats.samples,
+            "min_ns": stats.min_ns,
+            "max_ns": stats.max_ns,
+            "mean_ns": stats.mean_ns,
+            "std_dev_ns": stats.std_dev_ns,
+            "p50_ns": stats.p50_ns,
+            "p90_ns": stats.p90_ns,
+            "p95_ns": stats.p95_ns,
+            "p99_ns": stats.p99_ns,
+            "p999_ns": stats.p999_ns,
+            "min_us": stats.min_us,
+            "max_us": stats.max_us,
+            "mean_us": stats.mean_us,
+            "p50_us": stats.p50_us,
+            "p90_us": stats.p90_us,
+            "p95_us": stats.p95_us,
+            "p99_us": stats.p99_us,
+            "p999_us": stats.p999_us,
+        },
+        "gpu_metrics": gpu.to_json(),
+        "throttling_detected": throttling_detected,
+        "notes": notes,
+    });
+
+    let report_path = "latency_report.json";
+    let report_str = serde_json::to_string_pretty(&report)?;
+    std::fs::write(report_path, &report_str)?;
+
+    println!("latency_report.json written ({} bytes)", report_str.len());
+    println!("\n{}", "=".repeat(60));
+    println!("  P99 Benchmark Complete");
+    println!("  P99 push latency : {:.3} µs ({} ns)", stats.p99_us, stats.p99_ns);
+    println!("  Throughput       : {:.2}M edits/sec", throughput / 1_000_000.0);
+    println!("  GPU throttling   : {}", if throttling_detected { "YES (see notes)" } else { "NO" });
+    println!("{}\n", "=".repeat(60));
 
     Ok(())
 }
