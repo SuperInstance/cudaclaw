@@ -89,6 +89,47 @@ pub enum CommandType {
     Add = 2,
     Multiply = 3,
     BatchProcess = 4,
+    SpreadsheetEdit = 5,
+}
+
+// Cell value types (must match CUDA enum)
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CellValueType {
+    Empty = 0,
+    Number = 1,
+    String = 2,
+    Formula = 3,
+    Boolean = 4,
+    Error = 5,
+}
+
+// ============================================================
+// Spreadsheet CRDT Data Structures
+// ============================================================
+
+/// Cell identifier - unique position in spreadsheet
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CellID {
+    pub row: u32,
+    pub col: u32,
+}
+
+/// Spreadsheet edit operation for CRDT merge
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct SpreadsheetEdit {
+    pub cell_id: CellID,
+    pub new_type: CellValueType,
+    pub numeric_value: f64,
+    pub timestamp: u64,
+    pub node_id: u32,
+    pub is_delete: u32,
+    pub string_ptr: u64,
+    pub formula_ptr: u64,
+    pub value_len: u32,
+    pub reserved: u32,
 }
 
 // ============================================================
@@ -101,8 +142,17 @@ pub enum CommandType {
 // - multiply: float a, b, result (12 bytes)
 // - batch:   float* data (8), uint32_t count (4), float* output (8) = 20 bytes
 //           but with alignment: data(8) + count(4) + padding(4) + output(8) = 24 bytes
+// - spreadsheet: void* cells_ptr (8), void* edit_ptr (8), spreadsheet_id (4)
 //
 // So the union is 24 bytes total (largest member is batch)
+//
+// SPREADSHEET EDIT LAYOUT:
+// - cells_ptr: 8 bytes (pointer to cell array)
+// - edit_ptr: 8 bytes (pointer to SpreadsheetEdit in GPU memory)
+// - spreadsheet_id: 4 bytes
+//
+// For spreadsheet edits, the SpreadsheetEdit data is passed separately in GPU memory
+// to avoid size constraints of the command structure.
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -113,9 +163,9 @@ pub struct Command {
     // Union starts here (offset 16, 24 bytes total)
     pub data_a: f32,            // offset 16, 4 bytes  (add.a or multiply.a)
     pub data_b: f32,            // offset 20, 4 bytes  (add.b or multiply.b)
-    pub result: f32,            // offset 24, 4 bytes  (add.result or multiply.result)
-    pub batch_data: u64,        // offset 28, 8 bytes  (batch.data pointer)
-    pub batch_count: u32,       // offset 36, 4 bytes  (batch.count)
+    pub result: f32,            // offset 24, 4 bytes  (add.result or multiply.result or spreadsheet.edit_ptr)
+    pub batch_data: u64,        // offset 28, 8 bytes  (batch.data pointer or spreadsheet.cells_ptr)
+    pub batch_count: u32,       // offset 36, 4 bytes  (batch.count or spreadsheet.spreadsheet_id)
     pub _padding: u32,          // offset 40, 4 bytes  (padding for alignment)
     pub result_code: u32,       // offset 44, 4 bytes
 }
@@ -149,6 +199,40 @@ impl Command {
         self.data_b = b;
         self
     }
+
+    /// Create a spreadsheet edit command (batch style)
+    /// Processes multiple edits in parallel across the GPU warp.
+    ///
+    /// # Arguments
+    /// * `cells_ptr` - Pointer to SpreadsheetCell array in GPU memory
+    /// * `edits_ptr` - Pointer to array of SpreadsheetEdit structures in GPU memory
+    /// * `edit_count` - Number of edits to process
+    ///
+    /// # Note
+    /// The SpreadsheetEdit array must be copied to GPU memory separately.
+    /// Edits are processed in parallel across the warp (32 threads).
+    pub fn with_spreadsheet_edit_batch(
+        mut self,
+        cells_ptr: u64,
+        edits_ptr: u64,
+        edit_count: u32,
+    ) -> Self {
+        self.batch_data = cells_ptr;       // cells_ptr
+        self.batch_count = edit_count;     // edit_count
+
+        // Store edits_ptr in result (lower 32 bits) and _padding (upper 32 bits)
+        self.result = f32::from_bits((edits_ptr & 0xFFFFFFFF) as u32);
+        self._padding = ((edits_ptr >> 32) & 0xFFFFFFFF) as u32;
+
+        self
+    }
+
+    /// Get the edits_ptr from spreadsheet edit command
+    pub fn get_edits_ptr(&self) -> u64 {
+        let lower = self.result.to_bits() as u64;
+        let upper = self._padding as u64;
+        (upper << 32) | lower
+    }
 }
 
 // Command Queue (must match CUDA CommandQueue struct exactly)
@@ -156,23 +240,25 @@ pub const QUEUE_SIZE: usize = 16;
 
 #[repr(C)]
 pub struct CommandQueueHost {
-    pub status: u32,                         // offset 0,   4 bytes
-    pub commands: [Command; QUEUE_SIZE],     // offset 4,   16*48=768 bytes (FIXED: was 640)
-    pub head: u32,                           // offset 772, 4 bytes
-    pub tail: u32,                           // offset 776, 4 bytes
-    pub commands_processed: u64,             // offset 780, 8 bytes
-    pub total_cycles: u64,                   // offset 788, 8 bytes
-    pub idle_cycles: u64,                    // offset 796, 8 bytes
-    pub current_strategy: u32,               // offset 804, 4 bytes
-    pub consecutive_commands: u32,           // offset 808, 4 bytes
-    pub consecutive_idle: u32,               // offset 812, 4 bytes
-    pub last_command_cycle: u64,             // offset 816, 8 bytes
-    pub avg_command_latency_cycles: u64,     // offset 824, 8 bytes
-    pub _padding: [u8; 64],                  // offset 832, 64 bytes
+    pub status: u32,                         // offset 0,   4 bytes - queue status flag
+    pub commands: [Command; QUEUE_SIZE],     // offset 4,   768 bytes - circular buffer
+    pub head: u32,                           // offset 772, 4 bytes - write index (Rust)
+    pub tail: u32,                           // offset 776, 4 bytes - read index (GPU)
+    pub commands_pushed: u64,                // offset 780, 8 bytes - total commands pushed
+    pub commands_popped: u64,                // offset 788, 8 bytes - total commands popped
+    pub commands_processed: u64,             // offset 796, 8 bytes - total commands processed
+    pub total_cycles: u64,                   // offset 804, 8 bytes - total polling cycles
+    pub idle_cycles: u64,                    // offset 812, 8 bytes - idle polling cycles
+    pub current_strategy: u32,               // offset 820, 4 bytes - adaptive polling
+    pub consecutive_commands: u32,           // offset 824, 4 bytes - consecutive commands
+    pub consecutive_idle: u32,               // offset 828, 4 bytes - consecutive idle cycles
+    pub last_command_cycle: u64,             // offset 832, 8 bytes - last command timestamp
+    pub avg_command_latency_cycles: u64,     // offset 840, 8 bytes - avg latency
+    pub _padding: [u8; 48],                  // offset 848, 48 bytes - alignment padding
 }
 
 // Compile-time assertion to ensure CommandQueue size matches CUDA
-// CUDA CommandQueue is 896 bytes (832 + 64) aligned to 128*7=896
+// CUDA CommandQueue is 896 bytes (aligned to 128-byte boundary)
 const _: [(); std::mem::size_of::<CommandQueueHost>()] = [(); 896]; // Must be 896 bytes
 
 impl Default for CommandQueueHost {
@@ -182,6 +268,8 @@ impl Default for CommandQueueHost {
             commands: [Command::new(CommandType::NoOp, 0); QUEUE_SIZE],
             head: 0,
             tail: 0,
+            commands_pushed: 0,
+            commands_popped: 0,
             commands_processed: 0,
             total_cycles: 0,
             idle_cycles: 0,
@@ -190,7 +278,7 @@ impl Default for CommandQueueHost {
             consecutive_idle: 0,
             last_command_cycle: 0,
             avg_command_latency_cycles: 0,
-            _padding: [0; 64],
+            _padding: [0; 48],
         }
     }
 }

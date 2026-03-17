@@ -9,8 +9,8 @@
 // in src/cuda_claw.rs with compile-time size verification.
 //
 // ALIGNMENT VERIFICATION:
-// - Command: 48 bytes, 32-byte aligned
-// - CommandQueue: 896 bytes, 128-byte aligned
+// - Command: 48 bytes, 16-byte aligned
+// - CommandQueue: 896 bytes, 16-byte aligned
 // - All offsets verified at compile time (C++) and runtime (Rust)
 //
 // #[repr(C)] is used on Rust side to ensure C-compatible layout
@@ -68,7 +68,48 @@ enum CommandType : uint32_t {
     CMD_SHUTDOWN = 1,     // Shutdown the persistent kernel
     CMD_ADD = 2,          // Add two numbers
     CMD_MULTIPLY = 3,     // Multiply two numbers
-    CMD_BATCH_PROCESS = 4 // Batch process data
+    CMD_BATCH_PROCESS = 4, // Batch process data
+    CMD_SPREADSHEET_EDIT = 5 // Spreadsheet CRDT edit operation
+};
+
+// ============================================================
+// Spreadsheet CRDT Data Structures
+// ============================================================
+
+/**
+ * Cell identifier - unique position in spreadsheet
+ */
+struct __align__(8) CellID {
+    uint32_t row;
+    uint32_t col;
+};
+
+/**
+ * Cell value type enumeration
+ */
+enum CellValueType : uint32_t {
+    CELL_EMPTY = 0,
+    CELL_NUMBER = 1,
+    CELL_STRING = 2,
+    CELL_FORMULA = 3,
+    CELL_BOOLEAN = 4,
+    CELL_ERROR = 5
+};
+
+/**
+ * Spreadsheet edit operation for CRDT merge
+ */
+struct __align__(16) SpreadsheetEdit {
+    CellID cell_id;         // Which cell to edit
+    CellValueType new_type; // New cell type
+    double numeric_value;   // Numeric value (for NUMBER/BOOLEAN cells)
+    uint64_t timestamp;     // Edit timestamp for conflict resolution
+    uint32_t node_id;       // Which node made this edit
+    uint32_t is_delete;     // Is this a delete operation?
+    uint64_t string_ptr;    // Pointer to string value (for STRING cells)
+    uint64_t formula_ptr;   // Pointer to formula (for FORMULA cells)
+    uint32_t value_len;     // Length of string/formula value
+    uint32_t reserved;      // Padding for alignment
 };
 
 // ============================================================
@@ -77,7 +118,7 @@ enum CommandType : uint32_t {
 // Memory layout must match Rust Command struct exactly
 // See src/cuda_claw.rs for the Rust definition
 //
-struct __align__(32) Command {
+struct __align__(16) Command {
     CommandType type;     // offset 0,  4 bytes
     uint32_t id;          // offset 4,  4 bytes
     uint64_t timestamp;   // offset 8,  8 bytes
@@ -105,6 +146,12 @@ struct __align__(32) Command {
             uint32_t count;
             float* output;
         } batch;
+
+        struct {          // For CMD_SPREADSHEET_EDIT
+            void* cells_ptr;          // Pointer to spreadsheet cell array
+            void* edit_ptr;           // Pointer to SpreadsheetEdit in GPU memory
+            uint32_t spreadsheet_id;  // Which spreadsheet to edit
+        } spreadsheet;
     } data;               // offset 16, 24 bytes (largest is batch with alignment)
 
     uint32_t result_code; // offset 44, 4 bytes
@@ -115,30 +162,38 @@ struct __align__(32) Command {
 static_assert(sizeof(Command) == 48, "Command must be 48 bytes");
 
 // ============================================================
-// Command Queue Structure (896 bytes total)
+// Lock-Free Command Queue Structure (896 bytes total)
 // ============================================================
 // This structure is allocated in Unified Memory and shared
 // between CPU (Rust) and GPU (CUDA kernel).
 //
+// LOCK-FREE DESIGN:
+// - Uses a circular buffer with head/tail indices
+// - Producer (Rust) pushes to head, Consumer (GPU) pops from tail
+// - Atomic operations (atomicCAS) for thread-safe access
+// - No locks or mutexes required
+//
 // Memory layout must match Rust CommandQueueHost struct exactly
 // See src/cuda_claw.rs for the Rust definition
 //
-struct __align__(128) CommandQueue {
-    volatile QueueStatus status;  // offset 0,   4 bytes
-    Command commands[QUEUE_SIZE]; // offset 4,   768 bytes (16 * 48)
-    volatile uint32_t head;       // offset 772, 4 bytes
-    volatile uint32_t tail;       // offset 776, 4 bytes
-    volatile uint64_t commands_processed; // offset 780, 8 bytes
-    volatile uint64_t total_cycles;       // offset 788, 8 bytes
-    volatile uint64_t idle_cycles;        // offset 796, 8 bytes
-    volatile PollingStrategy current_strategy; // offset 804, 4 bytes
-    volatile uint32_t consecutive_commands;  // offset 808, 4 bytes
-    volatile uint32_t consecutive_idle;    // offset 812, 4 bytes
-    volatile uint64_t last_command_cycle;  // offset 816, 8 bytes
-    volatile uint64_t avg_command_latency_cycles; // offset 824, 8 bytes
-    uint8_t padding[64];            // offset 832, 64 bytes
+struct __align__(16) CommandQueue {
+    volatile QueueStatus status;  // offset 0,   4 bytes - queue status flag
+    Command commands[QUEUE_SIZE]; // offset 4,   768 bytes (16 * 48) - circular buffer
+    volatile uint32_t head;       // offset 772, 4 bytes - write index (Rust)
+    volatile uint32_t tail;       // offset 776, 4 bytes - read index (GPU)
+    volatile uint64_t commands_pushed; // offset 780, 8 bytes - total commands pushed
+    volatile uint64_t commands_popped; // offset 788, 8 bytes - total commands popped
+    volatile uint64_t commands_processed; // offset 796, 8 bytes - total commands processed
+    volatile uint64_t total_cycles;       // offset 804, 8 bytes - total polling cycles
+    volatile uint64_t idle_cycles;        // offset 812, 8 bytes - idle polling cycles
+    volatile PollingStrategy current_strategy; // offset 820, 4 bytes - adaptive polling
+    volatile uint32_t consecutive_commands;  // offset 824, 4 bytes - consecutive commands
+    volatile uint32_t consecutive_idle;    // offset 828, 4 bytes - consecutive idle cycles
+    volatile uint64_t last_command_cycle;  // offset 832, 8 bytes - last command timestamp
+    volatile uint64_t avg_command_latency_cycles; // offset 840, 8 bytes - avg latency
+    uint8_t padding[48];            // offset 848, 48 bytes - alignment padding
 };
-// Total: 896 bytes (aligned to 128-byte boundary)
+// Total: 896 bytes (aligned to 16-byte boundary)
 
 // Compile-time assertions to ensure size matches
 static_assert(sizeof(CommandQueue) == 896, "CommandQueue must be 896 bytes");
@@ -158,12 +213,14 @@ VERIFY_OFFSET(Command, result_code, 44);
 VERIFY_OFFSET(CommandQueue, status, 0);
 VERIFY_OFFSET(CommandQueue, head, 772);
 VERIFY_OFFSET(CommandQueue, tail, 776);
-VERIFY_OFFSET(CommandQueue, commands_processed, 780);
-VERIFY_OFFSET(CommandQueue, total_cycles, 788);
-VERIFY_OFFSET(CommandQueue, idle_cycles, 796);
-VERIFY_OFFSET(CommandQueue, current_strategy, 804);
-VERIFY_OFFSET(CommandQueue, consecutive_commands, 808);
-VERIFY_OFFSET(CommandQueue, consecutive_idle, 812);
+VERIFY_OFFSET(CommandQueue, commands_pushed, 780);
+VERIFY_OFFSET(CommandQueue, commands_popped, 788);
+VERIFY_OFFSET(CommandQueue, commands_processed, 796);
+VERIFY_OFFSET(CommandQueue, total_cycles, 804);
+VERIFY_OFFSET(CommandQueue, idle_cycles, 812);
+VERIFY_OFFSET(CommandQueue, current_strategy, 820);
+VERIFY_OFFSET(CommandQueue, consecutive_commands, 824);
+VERIFY_OFFSET(CommandQueue, consecutive_idle, 828);
 
 // ============================================================
 // Unified Memory Bridge Documentation
@@ -191,8 +248,8 @@ VERIFY_OFFSET(CommandQueue, consecutive_idle, 812);
 // - Critical for GPU-CPU synchronization
 //
 // ALIGNMENT:
-// - Command: 32-byte aligned for cache line efficiency
-// - CommandQueue: 128-byte aligned to prevent false sharing
+// - Command: 16-byte aligned for cache line efficiency
+// - CommandQueue: 16-byte aligned to prevent false sharing
 //
 // SAFETY:
 // - Both sides must agree on exact memory layout

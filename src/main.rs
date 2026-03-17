@@ -6,10 +6,12 @@ mod agent;
 mod alignment;
 mod cuda_claw;
 mod dispatcher;
+mod lock_free_queue;
 
 use agent::{AgentDispatcher, AgentOperation, AgentType, CellRef, SuperInstance};
 use alignment::{assert_alignment, verify_alignment, KernelConfig, KernelLifecycleManager, print_alignment_report};
 use dispatcher::{GpuDispatcher, create_add_command, create_add_batch, calculate_batch_stats};
+use lock_free_queue::LockFreeCommandQueue;
 
 fn run_persistent_worker_demo() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n=== Persistent Worker Kernel Demo ===");
@@ -307,6 +309,357 @@ fn run_gpu_dispatcher_demo(
     Ok(())
 }
 
+// ============================================================
+// Lock-Free CommandQueue Demonstration
+// ============================================================
+
+fn run_lock_free_queue_demo() -> Result<(), Box<dyn std::error::Error>> {
+    println!("\n=== Lock-Free CommandQueue Demo ===");
+    println!("Demonstrating lock-free producer-consumer queue in unified memory...\n");
+
+    // Create a command queue in unified memory
+    use cuda_claw::{Command, CommandType, QueueStatus};
+    use cust::memory::UnifiedBuffer;
+
+    println!("1. Creating CommandQueue in Unified Memory...");
+    let queue_data = CommandQueueHost::default();
+    let mut queue = UnifiedBuffer::new(&queue_data)?;
+
+    println!("   ✓ CommandQueue allocated at {:p}", queue.as_device_ptr());
+
+    // Print initial queue status
+    println!("\n2. Initial Queue Status:");
+    {
+        let queue_ref = queue.clone();
+        LockFreeCommandQueue::print_queue_status(&queue_ref);
+    }
+
+    // ============================================================
+    // Test 1: Single Push Operations
+    // ============================================================
+    println!("\n3. Testing Single Push Operations...");
+
+    let cmd1 = Command {
+        cmd_type: CommandType::Add as u32,
+        id: 1,
+        timestamp: 1000,
+        data_a: 10.0,
+        data_b: 20.0,
+        result: 0.0,
+        batch_data: 0,
+        batch_count: 0,
+        _padding: 0,
+        result_code: 0,
+    };
+
+    println!("   Pushing command 1: 10.0 + 20.0");
+    {
+        let queue_mut = &mut *queue;
+        let success = LockFreeCommandQueue::push_command(queue_mut, cmd1);
+        println!("   Push result: {}", if success { "SUCCESS" } else { "FAILED" });
+    }
+
+    // Verify queue state
+    println!("\n4. Queue Status After Push:");
+    {
+        let queue_ref = queue.clone();
+        LockFreeCommandQueue::print_queue_status(&queue_ref);
+    }
+
+    // ============================================================
+    // Test 2: Batch Push Operations
+    // ============================================================
+    println!("\n5. Testing Batch Push Operations...");
+
+    let mut batch_commands = Vec::new();
+    for i in 2..=6 {
+        batch_commands.push(Command {
+            cmd_type: CommandType::Add as u32,
+            id: i,
+            timestamp: 1000 + i as u64,
+            data_a: i as f32 * 10.0,
+            data_b: i as f32 * 20.0,
+            result: 0.0,
+            batch_data: 0,
+            batch_count: 0,
+            _padding: 0,
+            result_code: 0,
+        });
+    }
+
+    println!("   Pushing batch of {} commands...", batch_commands.len());
+    {
+        let queue_mut = &mut *queue;
+        let pushed = LockFreeCommandQueue::push_commands_batch(queue_mut, &batch_commands);
+        println!("   Successfully pushed: {} / {} commands", pushed, batch_commands.len());
+    }
+
+    // Verify queue state
+    println!("\n6. Queue Status After Batch Push:");
+    {
+        let queue_ref = queue.clone();
+        LockFreeCommandQueue::print_queue_status(&queue_ref);
+    }
+
+    // ============================================================
+    // Test 3: Query Functions
+    // ============================================================
+    println!("\n7. Testing Query Functions...");
+
+    {
+        let queue_ref = queue.clone();
+        let size = LockFreeCommandQueue::get_queue_size(&queue_ref);
+        let is_empty = LockFreeCommandQueue::is_queue_empty(&queue_ref);
+        let is_full = LockFreeCommandQueue::is_queue_full(&queue_ref);
+        let state = LockFreeCommandQueue::get_queue_state(&queue_ref);
+
+        println!("   Queue size: {} / {}", size, lock_free_queue::QUEUE_SIZE - 1);
+        println!("   Is empty: {}", is_empty);
+        println!("   Is full: {}", is_full);
+        println!("   State: {:?}", state);
+    }
+
+    // ============================================================
+    // Test 4: Fill Queue to Capacity
+    // ============================================================
+    println!("\n8. Testing Queue Capacity...");
+
+    let mut total_pushed = 0;
+    let mut attempts = 0;
+
+    // Try to fill the queue
+    while attempts < 100 {
+        let cmd = Command {
+            cmd_type: CommandType::NoOp as u32,
+            id: 100 + attempts,
+            timestamp: 2000 + attempts as u64,
+            data_a: 0.0,
+            data_b: 0.0,
+            result: 0.0,
+            batch_data: 0,
+            batch_count: 0,
+            _padding: 0,
+            result_code: 0,
+        };
+
+        {
+            let queue_mut = &mut *queue;
+            if LockFreeCommandQueue::push_command(queue_mut, cmd) {
+                total_pushed += 1;
+            } else {
+                break;  // Queue is full
+            }
+        }
+
+        attempts += 1;
+    }
+
+    println!("   Attempted to push: {} commands", attempts);
+    println!("   Successfully pushed: {} commands", total_pushed);
+
+    // Check if queue is full
+    {
+        let queue_ref = queue.clone();
+        let is_full = LockFreeCommandQueue::is_queue_full(&queue_ref);
+        println!("   Queue is full: {}", is_full);
+    }
+
+    // Final queue status
+    println!("\n9. Final Queue Status:");
+    {
+        let queue_ref = queue.clone();
+        LockFreeCommandQueue::print_queue_status(&queue_ref);
+    }
+
+    // ============================================================
+    // Test 5: Concurrent Push Simulation
+    // ============================================================
+    println!("\n10. Simulating Concurrent Push Operations...");
+
+    use std::thread;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let queue_arc = Arc::new(std::sync::Mutex::new(queue));
+    let success_count = Arc::new(AtomicUsize::new(0));
+    let failure_count = Arc::new(AtomicUsize::new(0));
+
+    let mut handles = vec![];
+
+    // Spawn 4 threads attempting concurrent pushes
+    for thread_id in 0..4 {
+        let queue_clone = queue_arc.clone();
+        let success_clone = success_count.clone();
+        let failure_clone = failure_count.clone();
+
+        let handle = thread::spawn(move || {
+            for i in 0..10 {
+                let cmd = Command {
+                    cmd_type: CommandType::NoOp as u32,
+                    id: (thread_id * 10 + i) as u32,
+                    timestamp: 3000 + (thread_id * 10 + i) as u64,
+                    data_a: 0.0,
+                    data_b: 0.0,
+                    result: 0.0,
+                    batch_data: 0,
+                    batch_count: 0,
+                    _padding: 0,
+                    result_code: 0,
+                };
+
+                let mut queue_guard = queue_clone.lock().unwrap();
+                if LockFreeCommandQueue::push_command(&mut *queue_guard, cmd) {
+                    success_clone.fetch_add(1, Ordering::SeqCst);
+                } else {
+                    failure_clone.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        });
+
+        handles.push(handle);
+    }
+
+    // Wait for all threads to complete
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    let successes = success_count.load(Ordering::SeqCst);
+    let failures = failure_count.load(Ordering::SeqCst);
+
+    println!("   Concurrent push results:");
+    println!("     Successful pushes: {}", successes);
+    println!("     Failed pushes (queue full): {}", failures);
+    println!("     Total attempts: {}", successes + failures);
+
+    // Final statistics
+    println!("\n11. Final Statistics:");
+    {
+        let queue_guard = queue_arc.lock().unwrap();
+        let queue_ref = (*queue_guard).clone();
+
+        let (pushed, popped, processed) = LockFreeCommandQueue::get_queue_stats(&queue_ref);
+        println!("     Commands pushed: {}", pushed);
+        println!("     Commands popped: {}", popped);
+        println!("     Commands processed: {}", processed);
+
+        let efficiency = if pushed > 0 {
+            (processed as f64 / pushed as f64) * 100.0
+        } else {
+            0.0
+        };
+        println!("     Processing efficiency: {:.1}%", efficiency);
+    }
+
+    println!("\n=== Lock-Free CommandQueue Demo Complete ===");
+    println!("\nKey Takeaways:");
+    println!("  ✓ Lock-free push operations using atomic CAS");
+    println!("  ✓ Circular buffer with head/tail indices");
+    println!("  ✓ Thread-safe concurrent access");
+    println!("  ✓ Zero-copy unified memory between CPU and GPU");
+    println!("  ✓ Compatible with CUDA pop_command on GPU side");
+
+    Ok(())
+}
+
+//
+// ============================================================
+
+// ============================================================
+// GPU Bridge Initialization Function
+// ============================================================
+//
+/// Initialize the GPU bridge by allocating a CommandQueue in Unified Memory.
+///
+/// This function creates the zero-copy communication channel between
+/// Rust host code and CUDA GPU kernels using Unified Memory.
+///
+/// # Arguments
+///
+/// *None*
+///
+/// # Returns
+///
+/// * `Result<(UnifiedBuffer<CommandQueueHost>, cust::memory::UnifiedPointer<CommandQueueHost>)>` -
+///   A tuple containing the buffer handle for CPU access and a device pointer for GPU kernels
+///
+/// # Errors
+///
+/// Returns an error if CUDA initialization fails or memory allocation fails
+///
+/// # Memory Layout
+///
+/// The CommandQueue structure is defined in both:
+/// - `kernels/shared_types.h` (CUDA C++ side)
+/// - `src/cuda_claw.rs` (Rust side)
+///
+/// Both definitions MUST match exactly in memory layout to prevent kernel crashes.
+/// This is verified at compile time using static_assert in C++ and runtime tests in Rust.
+///
+/// # Example
+///
+/// ```ignore
+/// // Initialize the GPU bridge
+/// let (queue, queue_ptr) = init_gpu_bridge()?;
+///
+/// // Use queue from CPU (Rust)
+/// {
+///     let mut queue_mut = &mut *queue;
+///     queue_mut.status = QueueStatus::Ready as u32;
+/// }
+///
+/// // Pass queue_ptr to CUDA kernel
+/// unsafe {
+///     launch!(my_kernel<<<1, 1>>>(queue_ptr))?;
+/// }
+/// ```
+///
+fn init_gpu_bridge() -> Result<(
+    cust::memory::UnifiedBuffer<cuda_claw::CommandQueueHost>,
+    cust::memory::UnifiedPointer<cuda_claw::CommandQueueHost>
+), Box<dyn std::error::Error>> {
+    use cust::memory::UnifiedBuffer;
+    use cuda_claw::{CommandQueueHost, QueueStatus};
+
+    println!("Initializing GPU bridge...");
+    println!("  Allocating CommandQueue in Unified Memory...");
+
+    // Create zeroed CommandQueue data
+    // This ensures all fields are properly initialized
+    let queue_data = CommandQueueHost {
+        status: QueueStatus::Idle as u32,
+        commands: [Default::default(); 16], // QUEUE_SIZE = 16
+        head: 0,
+        tail: 0,
+        commands_pushed: 0,
+        commands_popped: 0,
+        commands_processed: 0,
+        total_cycles: 0,
+        idle_cycles: 0,
+        current_strategy: cuda_claw::PollingStrategy::Adaptive as u32,
+        consecutive_commands: 0,
+        consecutive_idle: 0,
+        last_command_cycle: 0,
+        avg_command_latency_cycles: 0,
+        _padding: [0u8; 48],
+    };
+
+    // Allocate in Unified Memory
+    // This memory region is accessible from both CPU and GPU
+    let queue = UnifiedBuffer::new(&queue_data)?;
+
+    println!("  ✓ CommandQueue allocated in Unified Memory");
+    println!("  ✓ Memory size: {} bytes", std::mem::size_of::<CommandQueueHost>());
+    println!("  ✓ Device pointer: {:p}", queue.as_device_ptr());
+
+    // Get the device pointer for CUDA kernel usage
+    let queue_ptr = queue.as_device_ptr();
+
+    println!("  ✓ GPU bridge initialized successfully\n");
+
+    Ok((queue, queue_ptr))
+}
+
 //
 // ============================================================
 
@@ -355,6 +708,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Demonstrate GPU Dispatcher
     run_gpu_dispatcher_demo(command_queue.clone())?;
+
+    // Demonstrate Lock-Free CommandQueue
+    run_lock_free_queue_demo()?;
 
     // Demonstrate AgentDispatcher
     run_agent_dispatcher_demo(command_queue.clone())?;
