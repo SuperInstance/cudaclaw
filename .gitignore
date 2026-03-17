@@ -1,0 +1,7 @@
+target/
+*.exe
+*.ptx
+*.o
+*.obj
+*.pdb
+*.ilk
