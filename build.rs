@@ -48,6 +48,8 @@ fn main() {
             .arg(&ptx_path)
             .arg("--compiler-bindir")
             .arg(compiler_bindir)
+            .arg("-std=c++14")  // Required for atomic operations
+            .arg("-Xcompiler").arg("/wd4819")  // Suppress warnings about charset
             .output();
 
         match output {
