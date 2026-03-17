@@ -1398,6 +1398,246 @@ __global__ void crdt_parallel_batch_update_kernel(
 }
 
 // ============================================================
+// Warp-Level Kernels for Parallel Processing
+// ============================================================
+
+/**
+ * Warp-level command processing kernel
+ *
+ * Each warp in the grid processes one command from a queue.
+ * The command is broadcast to all 32 lanes, then each lane
+ * independently updates its assigned cell.
+ *
+ * Launch configuration: <<<num_warps, 32>>>
+ * - Each block is one warp (32 threads)
+ * - Number of blocks = number of commands to process
+ *
+ * @param crdt Pointer to CRDT state
+ * @param commands Array of warp commands to process
+ * @param num_commands Number of commands in array
+ * @param success_out Output array for success counts
+ */
+__global__ void crdt_warp_process_commands_kernel(
+    CRDTState* crdt,
+    const WarpCommand* commands,
+    uint32_t num_commands,
+    uint32_t* success_out
+) {
+    // Each block processes one command
+    const uint32_t cmd_idx = blockIdx.x;
+
+    if (cmd_idx >= num_commands) {
+        return;  // No command for this warp
+    }
+
+    // Process the command with warp-level parallelism
+    uint32_t success_count = warp_process_command(
+        crdt,
+        const_cast<WarpCommand*>(&commands[cmd_idx])
+    );
+
+    // Lane 0 writes the success count
+    if (threadIdx.x == 0) {
+        success_out[cmd_idx] = success_count;
+    }
+}
+
+/**
+ * Warp-level batch update kernel (32 cells per warp)
+ *
+ * Updates 32 consecutive cells in parallel per warp.
+ * Optimized for updating spreadsheet rows or ranges.
+ *
+ * Launch configuration: <<<num_warps, 32>>>
+ *
+ * @param crdt Pointer to CRDT state
+ * @param base_rows Starting row for each warp
+ * @param base_cols Starting column for each warp
+ * @param values_array Array of value arrays (32 per warp)
+ * @param timestamps Timestamp for each warp's update
+ * @param node_ids Node ID for each warp's update
+ * @param success_out Output array for success counts
+ */
+__global__ void crdt_warp_batch_update_kernel(
+    CRDTState* crdt,
+    const uint32_t* base_rows,
+    const uint32_t* base_cols,
+    const double* values_array,
+    const uint64_t* timestamps,
+    const uint32_t* node_ids,
+    uint32_t* success_out
+) {
+    const uint32_t warp_idx = blockIdx.x;
+
+    // Get parameters for this warp
+    uint32_t base_row = base_rows[warp_idx];
+    uint32_t base_col = base_cols[warp_idx];
+    uint64_t timestamp = timestamps[warp_idx];
+    uint32_t node_id = node_ids[warp_idx];
+
+    // Get pointer to this warp's values array
+    const double* values = &values_array[warp_idx * 32];
+
+    // Perform parallel update
+    uint32_t success_count = warp_parallel_update_32(
+        crdt,
+        base_row,
+        base_col,
+        values,
+        timestamp,
+        node_id
+    );
+
+    // Lane 0 writes success count
+    if (threadIdx.x == 0) {
+        success_out[warp_idx] = success_count;
+    }
+}
+
+/**
+ * Warp-level spreadsheet recalculation kernel
+ *
+ * Recalculates 32 cells in parallel per warp.
+ * Designed for efficient formula dependency updates.
+ *
+ * Launch configuration: <<<num_warps, 32>>>
+ *
+ * @param crdt Pointer to CRDT state
+ * @param cell_indices_array Array of cell index arrays (32 per warp)
+ * @param timestamp Recalculation timestamp
+ * @param node_id Node performing recalculation
+ * @param success_out Output array for success counts
+ */
+__global__ void crdt_warp_recalculate_kernel(
+    CRDTState* crdt,
+    const uint32_t* cell_indices_array,
+    uint64_t timestamp,
+    uint32_t node_id,
+    uint32_t* success_out
+) {
+    const uint32_t warp_idx = blockIdx.x;
+
+    // Get pointer to this warp's cell indices
+    const uint32_t* cell_indices = &cell_indices_array[warp_idx * 32];
+
+    // Perform parallel recalculation
+    uint32_t success_count = warp_recalculate_cells(
+        crdt,
+        cell_indices,
+        timestamp,
+        node_id
+    );
+
+    // Lane 0 writes success count
+    if (threadIdx.x == 0) {
+        success_out[warp_idx] = success_count;
+    }
+}
+
+/**
+ * Persistent worker kernel with warp-level command processing
+ *
+ * This kernel continuously polls a command queue and processes
+ * commands using warp-level parallelism. Each warp processes
+ * one command at a time, achieving 32 parallel cell updates.
+ *
+ * Launch configuration: <<<num_warps, 32>>>
+ * - Each warp is one block with 32 threads
+ * - Only lane 0 of each warp manages queue polling
+ *
+ * @param crdt Pointer to CRDT state
+ * @param command_queue Pointer to command queue (unified memory)
+ * @param results Output array for processing results
+ */
+__global__ void crdt_warp_persistent_worker_kernel(
+    CRDTState* crdt,
+    CommandQueue* command_queue,
+    uint32_t* results
+) {
+    const int lane_id = threadIdx.x;
+    const int warp_idx = blockIdx.x;
+
+    // Only lane 0 manages queue polling
+    if (lane_id == 0) {
+        // Persistent polling loop
+        while (command_queue->is_running) {
+            // Memory fence for PCIe visibility
+            __threadfence_system();
+
+            uint32_t head = command_queue->head;
+            uint32_t tail = command_queue->tail;
+
+            if (head != tail) {
+                // Command available - fetch it
+                uint32_t cmd_idx = tail % 1024;
+                Command cmd = command_queue->buffer[cmd_idx];
+
+                // Convert to WarpCommand structure
+                WarpCommand warp_cmd(
+                    0, 0,              // base_row, base_col (will be derived)
+                    cmd.cmd_type,      // operation type
+                    cmd.timestamp,     // timestamp
+                    0,                 // node_id (derived from context)
+                    cmd.data_a         // base_value
+                );
+
+                // Process with warp-level parallelism
+                // Store command in shared memory for warp access
+                __shared__ WarpCommand shared_cmd;
+                shared_cmd = warp_cmd;
+
+                // Synchronize warp
+                __syncwarp();
+
+                // Broadcast and process command
+                uint32_t success_count = warp_process_command(crdt, &shared_cmd);
+
+                // Advance tail
+                tail = (tail + 1) % 1024;
+                command_queue->tail = tail;
+
+                // Update statistics
+                command_queue->commands_processed++;
+
+                // Memory fence to ensure CPU sees our updates
+                __threadfence_system();
+
+                // Store result (only lane 0 writes)
+                if (lane_id == 0) {
+                    results[warp_idx] = success_count;
+                }
+            } else {
+                // Queue empty - sleep to prevent thermal throttling
+                #if __CUDA_ARCH__ >= 700
+                    __nanosleep(100);
+                #else
+                    for (volatile int i = 0; i < 100; i++) {
+                        __threadfence_block();
+                    }
+                #endif
+            }
+        }
+    } else {
+        // Other lanes wait for lane 0 to broadcast commands
+        // They participate in warp_process_command
+        while (command_queue->is_running) {
+            // Participate in warp synchronization
+            // Actual work happens in warp_process_command
+            __syncwarp();
+
+            if (!command_queue->is_running) {
+                break;
+            }
+
+            // Brief sleep
+            #if __CUDA_ARCH__ >= 700
+                __nanosleep(100);
+            #endif
+        }
+    }
+}
+
+// ============================================================
 // Optimized Memory Access Patterns
 // ============================================================
 
