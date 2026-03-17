@@ -23,6 +23,7 @@ mod bridge;
 mod cuda_claw;
 mod dispatcher;
 mod gpu_metrics;
+mod installer;
 mod lock_free_queue;
 mod monitor;
 mod volatile_dispatcher;
@@ -903,6 +904,50 @@ fn run_persistent_kernel_demo() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // ============================================================
+    // CLI: Check for "install" subcommand before CUDA init
+    // ============================================================
+    // The installer can run without a live GPU (simulated mode),
+    // so we handle it before cust::quick_init() which would fail
+    // on machines without CUDA.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    if args.first().map(|s| s.as_str()) == Some("install") {
+        // Handle --help
+        if args.iter().any(|a| a == "--help" || a == "-h") {
+            installer::print_installer_help();
+            return Ok(());
+        }
+
+        // Handle --list-profiles
+        if args.iter().any(|a| a == "--list-profiles") {
+            let config = installer::parse_installer_args(&args)
+                .unwrap_or_default();
+            let inst = installer::Installer::new(config);
+            inst.list_profiles()?;
+            return Ok(());
+        }
+
+        // Handle --show-profile
+        if args.iter().any(|a| a == "--show-profile") {
+            let config = installer::parse_installer_args(&args)
+                .unwrap_or_default();
+            let inst = installer::Installer::new(config);
+            inst.show_profile()?;
+            return Ok(());
+        }
+
+        // Run full installer pipeline
+        if let Some(config) = installer::parse_installer_args(&args) {
+            let inst = installer::Installer::new(config);
+            let (profile, path) = inst.run().await?;
+            println!("Installer complete. Profile saved to: {}", path.display());
+            println!("Role: {}, Score: {:.1}, P99 RTT: {:.2} µs",
+                profile.role_name, profile.best_score, profile.achieved_p99_rtt_us);
+            return Ok(());
+        }
+    }
+
     println!("CudaClaw - GPU-Accelerated SmartCRDT Orchestrator");
     println!("==============================================\n");
 
