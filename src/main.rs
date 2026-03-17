@@ -698,10 +698,10 @@ fn run_gpu_bridge_demo() -> Result<(), Box<dyn std::error::Error>> {
 
     // Method 4: Generic allocation with any type
     println!("\nMethod 4: Generic allocation with different types");
-    let array_bridge = GpuBridge::<[f32; 1024]>::init()?;
+    let array_bridge = GpuBridge::<[f32; 32]>::init()?;
     let array_ptr = array_bridge.as_device_ptr();
 
-    println!("  ✓ Allocated f32 array of 1024 elements");
+    println!("  ✓ Allocated f32 array of 32 elements");
     println!("  ✓ Size: {} bytes", array_bridge.size_bytes());
     println!("  ✓ Device pointer: {:p}", array_ptr);
 

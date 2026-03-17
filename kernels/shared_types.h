@@ -78,29 +78,34 @@ struct CommandQueue {
     Command buffer[1024];          // offset 0,    48,992 bytes - Command ring buffer
 
     // ============================================================
+    // QUEUE STATUS (volatile for cross-CPU/GPU visibility)
+    // ============================================================
+    volatile uint32_t status;       // offset 48,992, 4 bytes  - Queue status
+
+    // ============================================================
     // QUEUE INDICES (volatile for cross-CPU/GPU visibility)
     // ============================================================
-    volatile uint32_t head;         // offset 48,992, 4 bytes - Write index (Rust writes)
-    volatile uint32_t tail;         // offset 48,996, 4 bytes - Read index (GPU reads)
+    volatile uint32_t head;         // offset 48,996, 4 bytes - Write index (Rust writes)
+    volatile uint32_t tail;         // offset 49,000, 4 bytes - Read index (GPU reads)
 
     // ============================================================
     // CONTROL FLAGS (volatile)
     // ============================================================
-    volatile bool is_running;       // offset 49,000, 1 byte   - Kernel running flag
-    uint8_t _padding[3];            // offset 49,001, 3 bytes   - Alignment padding
+    volatile bool is_running;       // offset 49,004, 1 byte   - Kernel running flag
+    uint8_t _padding[3];            // offset 49,005, 3 bytes   - Alignment padding
 
     // ============================================================
     // STATISTICS (optional, for monitoring)
     // ============================================================
-    volatile uint64_t commands_sent;     // offset 49,004, 8 bytes - Total commands sent
-    volatile uint64_t commands_processed; // offset 49,012, 8 bytes - Total commands processed
-    uint8_t _stats_padding[8];      // offset 49,020, 8 bytes   - Future expansion
+    volatile uint64_t commands_sent;     // offset 49,008, 8 bytes - Total commands sent
+    volatile uint64_t commands_processed; // offset 49,016, 8 bytes - Total commands processed
+    uint8_t _stats_padding[8];      // offset 49,024, 8 bytes   - Future expansion
 };
 #pragma pack(pop)
 
-// Total size: 49,028 bytes
+// Total size: 49,192 bytes
 // Compile-time verification
-// static_assert(sizeof(CommandQueue) == 49028, "CommandQueue size mismatch");
+static_assert(sizeof(CommandQueue) == 49192, "CommandQueue size mismatch");
 
 // ============================================================
 // FIELD OFFSET VERIFICATION

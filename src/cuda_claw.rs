@@ -154,7 +154,7 @@ pub struct SpreadsheetEdit {
 // For spreadsheet edits, the SpreadsheetEdit data is passed separately in GPU memory
 // to avoid size constraints of the command structure.
 
-#[repr(C)]
+#[repr(C, packed(4))]
 #[derive(Debug, Clone, Copy)]
 pub struct Command {
     pub cmd_type: u32,          // offset 0,  4 bytes
@@ -239,26 +239,29 @@ impl Command {
 // NEW BINARY INTERFACE - from shared_types.h
 pub const QUEUE_SIZE: usize = 1024;
 
-#[repr(C, align(16))]
+#[repr(C, packed(4))]
+#[derive(Clone, Copy)]
 pub struct CommandQueueHost {
     pub buffer: [Command; QUEUE_SIZE],       // offset 0,    48,992 bytes - Command ring buffer
-    pub head: u32,                           // offset 48,992, 4 bytes  - Write index (Rust)
-    pub tail: u32,                           // offset 48,996, 4 bytes  - Read index (GPU)
-    pub is_running: bool,                    // offset 49,000, 1 byte   - Running flag
-    pub _padding: [u8; 3],                   // offset 49,001, 3 bytes  - Alignment padding
-    pub commands_sent: u64,                  // offset 49,004, 8 bytes - Total commands sent
-    pub commands_processed: u64,             // offset 49,012, 8 bytes - Total commands processed
-    pub _stats_padding: [u8; 8],             // offset 49,020, 8 bytes - Reserved for future use
+    pub status: u32,                         // offset 48,992, 4 bytes  - Queue status
+    pub head: u32,                           // offset 48,996, 4 bytes  - Write index (Rust)
+    pub tail: u32,                           // offset 49,000, 4 bytes  - Read index (GPU)
+    pub is_running: bool,                    // offset 49,004, 1 byte   - Running flag
+    pub _padding: [u8; 3],                   // offset 49,005, 3 bytes  - Alignment padding
+    pub commands_sent: u64,                  // offset 49,008, 8 bytes - Total commands sent
+    pub commands_processed: u64,             // offset 49,016, 8 bytes - Total commands processed
+    pub _stats_padding: [u8; 8],             // offset 49,024, 8 bytes - Reserved for future use
 }
 
 // Compile-time assertion to ensure CommandQueue size matches CUDA
-// CUDA CommandQueue is 49,028 bytes (16-byte aligned)
-const _: [(); std::mem::size_of::<CommandQueueHost>()] = [(); 49028]; // Must be 49,028 bytes
+// CommandQueue with status field is 49,192 bytes (4-byte packed)
+const _: [(); std::mem::size_of::<CommandQueueHost>()] = [(); 49192]; // Must be 49,192 bytes
 
 impl Default for CommandQueueHost {
     fn default() -> Self {
         CommandQueueHost {
             buffer: [Command::new(CommandType::NoOp, 0); QUEUE_SIZE],
+            status: 0, // QueueStatus::Idle as u32
             head: 0,
             tail: 0,
             is_running: false,

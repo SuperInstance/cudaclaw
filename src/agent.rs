@@ -132,6 +132,9 @@ impl Default for SpreadsheetCell {
     }
 }
 
+// SAFETY: SpreadsheetCell is safe to copy to GPU (no internal pointers)
+unsafe impl cust::memory::DeviceCopy for SpreadsheetCell {}
+
 // ============================================================
 // CRDT Grid State (matches CUDA CrdtState)
 // ============================================================

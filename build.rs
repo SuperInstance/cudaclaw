@@ -38,11 +38,16 @@ fn main() {
 
         println!("cargo:warning=Compiling CUDA kernel: {:?}", cu_path);
 
+        // Find VS 2019 Build Tools compiler
+        let compiler_bindir = "C:\\Program Files (x86)\\Microsoft Visual Studio\\2019\\BuildTools\\VC\\Tools\\MSVC\\14.29.30133\\bin\\HostX64\\x64";
+
         let output = Command::new("nvcc")
             .arg("-ptx")
             .arg(&cu_path)
             .arg("-o")
             .arg(&ptx_path)
+            .arg("--compiler-bindir")
+            .arg(compiler_bindir)
             .output();
 
         match output {

@@ -77,7 +77,7 @@ use std::fmt;
 /// The type `T` must have a stable memory layout (#[repr(C)]) and
 /// not contain any Rust-specific features that would break across
 /// the FFI boundary to CUDA.
-pub struct GpuBridge<T> {
+pub struct GpuBridge<T: cust::memory::DeviceCopy> {
     /// The UnifiedBuffer that manages the shared memory
     buffer: UnifiedBuffer<T>,
 
@@ -85,7 +85,7 @@ pub struct GpuBridge<T> {
     device_ptr: UnifiedPointer<T>,
 }
 
-impl<T> GpuBridge<T> {
+impl<T: cust::memory::DeviceCopy> GpuBridge<T> {
     /// Initialize a new GPU Bridge with a single instance of T in Unified Memory
     ///
     /// This method allocates memory that is accessible from both CPU and GPU.
@@ -388,7 +388,7 @@ impl<T> GpuBridge<T> {
 // DEBUG IMPL
 // ============================================================
 
-impl<T> fmt::Debug for GpuBridge<T> {
+impl<T: cust::memory::DeviceCopy> fmt::Debug for GpuBridge<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("GpuBridge")
             .field("size_bytes", &self.size_bytes())
@@ -404,11 +404,11 @@ impl<T> fmt::Debug for GpuBridge<T> {
 
 // GpuBridge is Send because UnifiedBuffer is Send
 // The device pointer is valid across threads
-unsafe impl<T: Send> Send for GpuBridge<T> {}
+unsafe impl<T: cust::memory::DeviceCopy + Send> Send for GpuBridge<T> {}
 
 // GpuBridge is Sync because UnifiedBuffer is Sync
 // Multiple threads can read the device pointer safely
-unsafe impl<T: Sync> Sync for GpuBridge<T> {}
+unsafe impl<T: cust::memory::DeviceCopy + Sync> Sync for GpuBridge<T> {}
 
 // ============================================================
 // CONVENIENCE FUNCTIONS
@@ -476,7 +476,7 @@ pub struct GpuBridgeBuilder<T> {
     _phantom: std::marker::PhantomData<T>,
 }
 
-impl<T> GpuBridgeBuilder<T> {
+impl<T: cust::memory::DeviceCopy> GpuBridgeBuilder<T> {
     /// Create a new builder
     pub fn new() -> Self {
         GpuBridgeBuilder {
@@ -501,7 +501,7 @@ impl<T> GpuBridgeBuilder<T> {
     }
 }
 
-impl<T> Default for GpuBridgeBuilder<T> {
+impl<T: cust::memory::DeviceCopy> Default for GpuBridgeBuilder<T> {
     fn default() -> Self {
         Self::new()
     }
