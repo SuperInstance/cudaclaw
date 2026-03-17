@@ -1571,7 +1571,7 @@ fn run_p99_cell_edit_benchmark() -> Result<(), Box<dyn std::error::Error>> {
         let cmd = Command {
             cmd_type: CommandType::SpreadsheetEdit as u32,
             id: (i % u32::MAX as usize) as u32,
-            timestamp: Instant::now().elapsed().as_nanos() as u64,
+            timestamp: i as u64,
             data_a: rng.gen_range(0.0_f32..1_000_000.0),
             data_b: rng.gen_range(0.0_f32..1_000_000.0),
             result: 0.0,
