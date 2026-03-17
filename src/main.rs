@@ -25,6 +25,7 @@ mod dispatcher;
 mod gpu_metrics;
 mod installer;
 mod lock_free_queue;
+mod ramify;
 mod monitor;
 mod volatile_dispatcher;
 
@@ -911,6 +912,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // so we handle it before cust::quick_init() which would fail
     // on machines without CUDA.
     let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // ============================================================
+    // CLI: Check for "ramify" subcommand before CUDA init
+    // ============================================================
+    // The Ramify engine can run demonstrations and status checks
+    // without a live GPU, so we handle it before cust::quick_init().
+    if args.first().map(|s| s.as_str()) == Some("ramify") {
+        let sub_args: Vec<String> = args[1..].to_vec();
+
+        // Handle --help
+        if sub_args.iter().any(|a| a == "--help" || a == "-h") {
+            ramify::print_ramify_help();
+            return Ok(());
+        }
+
+        match ramify::parse_ramify_args(&sub_args) {
+            Some(ramify::RamifyCliAction::Status) | Some(ramify::RamifyCliAction::StatusWithConfig(..)) => {
+                let config = match ramify::parse_ramify_args(&sub_args) {
+                    Some(ramify::RamifyCliAction::StatusWithConfig(c)) => c,
+                    _ => ramify::RamifyConfig::default(),
+                };
+                ramify::show_status(config);
+                return Ok(());
+            }
+            Some(ramify::RamifyCliAction::Demo) | Some(ramify::RamifyCliAction::DemoWithConfig(..)) => {
+                let config = match ramify::parse_ramify_args(&sub_args) {
+                    Some(ramify::RamifyCliAction::DemoWithConfig(c)) => c,
+                    _ => ramify::RamifyConfig::default(),
+                };
+                ramify::run_demo(config);
+                return Ok(());
+            }
+            None => {
+                ramify::print_ramify_help();
+                return Ok(());
+            }
+        }
+    }
 
     if args.first().map(|s| s.as_str()) == Some("install") {
         // Handle --help
