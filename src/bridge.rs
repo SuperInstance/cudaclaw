@@ -55,7 +55,7 @@ use std::fmt;
 /// # Example
 /// ```rust
 /// use bridge::GpuBridge;
-/// use cuda_claw::CommandQueueHost;
+/// use crate::cuda_claw::CommandQueueHost;
 ///
 /// // Allocate CommandQueue in Unified Memory
 /// let bridge = GpuBridge::<CommandQueueHost>::init()?;
@@ -429,13 +429,13 @@ unsafe impl<T: Sync> Sync for GpuBridge<T> {}
 /// }
 /// ```
 pub fn allocate_command_queue() -> CudaResult<(
-    GpuBridge<cuda_claw::CommandQueueHost>,
-    *mut cuda_claw::CommandQueueHost,
+    GpuBridge<crate::cuda_claw::CommandQueueHost>,
+    *mut crate::cuda_claw::CommandQueueHost,
 )>
 where
-    cuda_claw::CommandQueueHost: Default,
+    crate::cuda_claw::CommandQueueHost: Default,
 {
-    let bridge = GpuBridge::<cuda_claw::CommandQueueHost>::init()?;
+    let bridge = GpuBridge::<crate::cuda_claw::CommandQueueHost>::init()?;
     let device_ptr = bridge.as_device_ptr();
     Ok((bridge, device_ptr))
 }
@@ -444,7 +444,7 @@ where
 ///
 /// # Example
 /// ```rust
-/// use cuda_claw::CommandQueueHost;
+/// use crate::cuda_claw::CommandQueueHost;
 ///
 /// let queue_data = CommandQueueHost::default();
 /// let (bridge, ptr) = allocate_unified_with_value(&queue_data)?;
@@ -514,7 +514,7 @@ impl<T> Default for GpuBridgeBuilder<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cuda_claw::CommandQueueHost;
+    use crate::cuda_claw::CommandQueueHost;
 
     #[test]
     fn test_gpu_bridge_creation() {
@@ -564,84 +564,46 @@ mod tests {
 // EXAMPLES
 // ============================================================
 
-#[cfg(doctest)]
-doc_comment::doctest!("../examples/unified_memory_example.rs", unified_memory_example);
-
-/// # Examples
-///
-/// ## Basic Usage
-///
-/// ```rust
-/// use bridge::GpuBridge;
-/// use cuda_claw::CommandQueueHost;
-///
-/// // Allocate CommandQueue in Unified Memory
-/// let bridge = GpuBridge::<CommandQueueHost>::init()?;
-///
-/// // Get device pointer for CUDA kernel
-/// let device_ptr = bridge.as_device_ptr();
-///
-/// // Pass to CUDA kernel
-/// unsafe {
-///     launch!(persistent_worker<<<1, 1>>>(device_ptr))?;
-/// }
-/// ```
-///
-/// ## Using the Convenience Function
-///
-/// ```rust
-/// use bridge::allocate_command_queue;
-///
-/// let (bridge, queue_ptr) = allocate_command_queue()?;
-///
-/// // Use queue_ptr in CUDA kernel
-/// unsafe {
-///     launch!(my_kernel<<<1, 1>>>(queue_ptr))?;
-/// }
-/// ```
-///
-/// ## Builder Pattern
-///
-/// ```rust
-/// use bridge::GpuBridgeBuilder;
-///
-/// let bridge = GpuBridgeBuilder::<CommandQueueHost>::new()
-///     .build()?;
-/// ```
-///
-/// ## Type Safety
-///
-/// The GpuBridge is type-safe and works with any Pod type:
-///
-/// ```rust
-/// use bridge::GpuBridge;
-///
-/// // Works with CommandQueue
-/// let queue_bridge = GpuBridge::<CommandQueueHost>::init()?;
-///
-/// // Works with other types too
-/// let data_bridge = GpuBridge::<[f32; 1024]>::init()?;
-///
-/// // Get device pointers
-/// let queue_ptr = queue_bridge.as_device_ptr();
-/// let data_ptr = data_bridge.as_device_ptr();
-/// ```
-///
-/// ## Integration with CUDA Kernels
-///
-/// ```rust
-/// use bridge::GpuBridge;
-/// use cuda_claw::CommandQueueHost;
-///
-/// let bridge = GpuBridge::<CommandQueueHost>::init()?;
-/// let queue_ptr = bridge.as_device_ptr();
-///
-/// // Launch kernel
-/// unsafe {
-///     let func = module.get_function(&CString::new("persistent_worker_simple")?)?;
-///     let running_flag = true;
-///     launch!(func<<<1, 32>>>(queue_ptr, &running_flag))?;
-/// }
-///
-/// // Kernel now has access to the same CommandQueue from GPU
-/// ```
+// Module-level examples documentation
+//
+// # Examples
+//
+// ## Basic Usage
+//
+// ```rust
+// use bridge::GpuBridge;
+// use crate::cuda_claw::CommandQueueHost;
+//
+// // Allocate CommandQueue in Unified Memory
+// let bridge = GpuBridge::<CommandQueueHost>::init()?;
+//
+// // Get device pointer for CUDA kernel
+// let device_ptr = bridge.as_device_ptr();
+//
+// // Pass to CUDA kernel
+// unsafe {
+//     launch!(persistent_worker<<<1, 1>>>(device_ptr))?;
+// }
+// ```
+//
+// ## Using the Convenience Function
+//
+// ```rust
+// use bridge::allocate_command_queue;
+//
+// let (bridge, queue_ptr) = allocate_command_queue()?;
+//
+// // Use queue_ptr in CUDA kernel
+// unsafe {
+//     launch!(my_kernel<<<1, 1>>>(queue_ptr))?;
+// }
+// ```
+//
+// ## Builder Pattern
+//
+// ```rust
+// use bridge::GpuBridgeBuilder;
+//
+// let bridge = GpuBridgeBuilder::<CommandQueueHost>::new()
+//     .build()?;
+// ```

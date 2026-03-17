@@ -10,7 +10,7 @@
 // - Single thread (thread 0, block 0) manages queue
 // - Lock-free ring buffer with volatile head/tail indices
 // - __threadfence_system() for PCIe memory consistency
-// - SmartCRDT integration for spreadsheet operations
+// - SmartCRDT integration temporarily disabled for testing
 //
 // ARCHITECTURE:
 // - Thread 0, Block 0: Queue manager and command processor
@@ -27,7 +27,7 @@
 
 #include <cuda_runtime.h>
 #include "shared_types.h"
-#include "smartcrdt.cuh"
+// #include "smartcrdt.cuh"  // Temporarily disabled for testing
 
 // ============================================================
 // Configuration Constants
@@ -37,15 +37,14 @@
 #define POLL_DELAY_NS 1000     // 1 microsecond - balances latency and power
 
 // ============================================================
-// SmartCRDT Integration - Cell Edit Processing
+// Cell Edit Processing (Simplified - without SmartCRDT)
 // ============================================================
 
 /**
- * Process an EDIT_CELL command using SmartCRDT merge logic
+ * Process an EDIT_CELL command
  *
- * This function handles the actual cell edit operation on the
- * spreadsheet using CRDT (Conflict-free Replicated Data Type)
- * merge semantics to ensure consistency across nodes.
+ * This is a simplified version for testing the persistent kernel
+ * architecture. SmartCRDT integration will be added back later.
  *
  * @param cell_id  - The cell identifier to edit
  * @param value    - The new value to set
@@ -58,37 +57,9 @@ __device__ void process_edit_cell(
     uint64_t timestamp,
     uint32_t node_id
 ) {
-    // Calculate cell index for coalesced memory access
-    // This ensures efficient GPU memory access patterns
-    uint32_t row = cell_id / MAX_COLS;
-    uint32_t col = cell_id % MAX_COLS;
-    uint32_t cell_idx = get_coalesced_cell_index(row, col, MAX_COLS);
-
-    // Create a SpreadsheetEdit structure for CRDT merge
-    SpreadsheetEdit edit;
-    edit.cell_id.row = row;
-    edit.cell_id.col = col;
-    edit.new_type = CELL_NUMBER;  // Assuming numeric value
-    edit.numeric_value = value;
-    edit.timestamp = timestamp;
-    edit.node_id = node_id;
-    edit.is_delete = 0;  // This is an edit, not a delete
-    edit.string_ptr = 0;  // No string data
-    edit.formula_ptr = 0;  // No formula data
-    edit.value_len = 0;
-    edit.reserved = 0;
-
-    // In a real implementation, we would have access to the actual
-    // spreadsheet cell array here. For now, we'll demonstrate the
-    // SmartCRDT merge logic.
-
-    // Example: Access global spreadsheet cell array
-    // extern __device__ SpreadsheetCell g_spreadsheet_cells[];
-    // SpreadsheetCell* cell = &g_spreadsheet_cells[cell_idx];
-    // atomic_update_cell(cell, edit);
-
-    printf("[GPU] EDIT_CELL: cell[%u] = %.2f (ts=%lu, node=%u)\n",
-           cell_id, value, timestamp, node_id);
+    // Simplified cell processing - just log for now
+    printf("[GPU] EDIT_CELL: cell[%u] = %.2f (ts=%llu, node=%u)\n",
+           cell_id, value, (unsigned long long)timestamp, node_id);
 }
 
 /**
@@ -193,10 +164,10 @@ extern "C" __global__ void persistent_worker(CommandQueue* queue) {
             // ============================================================
             // PROCESS COMMAND BASED ON TYPE
             // ============================================================
-            switch (cmd.type) {
+            switch (cmd.cmd_type) {
                 case NOOP:
                     // No-operation - just acknowledge
-                    printf("[GPU] NOOP: Command %u processed\n", cmd._padding);
+                    printf("[GPU] NOOP: Command %u processed\n", cmd.id);
                     break;
 
                 case EDIT_CELL: {
@@ -204,14 +175,14 @@ extern "C" __global__ void persistent_worker(CommandQueue* queue) {
                     // SMARTCRDT MERGE LOGIC
                     // ============================================================
                     // Extract cell_id and value from command data
-                    uint32_t cell_id = cmd.data.edit_cell.cell_id;
-                    float value = cmd.data.edit_cell.value;
+                    uint32_t cell_id = cmd.id;
+                    float value = cmd.data_a;
 
                     // Process the cell edit using SmartCRDT merge logic
                     process_edit_cell(
                         cell_id,
                         value,
-                        0,  // timestamp (would be in command)
+                        cmd.timestamp,  // timestamp
                         0   // node_id (would be in command)
                     );
 
@@ -225,9 +196,9 @@ extern "C" __global__ void persistent_worker(CommandQueue* queue) {
                     // CRDT SYNCHRONIZATION
                     // ============================================================
                     // Extract sync parameters from command data
-                    uint32_t node_id = cmd.data.sync_crdt.node_id;
-                    uint64_t timestamp = cmd.data.sync_crdt.timestamp;
-                    uint32_t vector_size = cmd.data.sync_crdt.vector_size;
+                    uint32_t node_id = cmd.id;
+                    uint64_t timestamp = cmd.timestamp;
+                    uint32_t vector_size = cmd.batch_count;
 
                     // Process CRDT synchronization
                     process_sync_crdt(node_id, timestamp, vector_size);
@@ -252,7 +223,7 @@ extern "C" __global__ void persistent_worker(CommandQueue* queue) {
 
                 default:
                     // Unknown command type - log error
-                    printf("[GPU] ERROR: Unknown command type %u\n", cmd.type);
+                    printf("[GPU] ERROR: Unknown command type %u\n", cmd.cmd_type);
                     break;
             }
 

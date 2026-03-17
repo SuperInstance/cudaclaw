@@ -317,7 +317,7 @@ impl AgentOperation {
 
 pub struct AgentDispatcher {
     /// Pool of active SuperInstance agents
-    agents: HashMap<String, SuperInstance>,
+    pub agents: HashMap<String, SuperInstance>,  // Made public for external access
     /// CRDT spreadsheet state (shared with GPU via Unified Memory)
     crdt_grid: CrdtGrid,
     /// Command queue for GPU communication

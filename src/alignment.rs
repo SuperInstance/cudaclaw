@@ -6,7 +6,7 @@
 // 3. Watchdog mechanisms for kernel timeout detection
 // 4. Kernel lifecycle management
 
-use cuda_claw::{Command, CommandQueueHost, CommandType, QueueStatus};
+use crate::cuda_claw::{Command, CommandQueueHost, CommandType, QueueStatus};
 use cust::memory::UnifiedBuffer;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};

@@ -270,10 +270,13 @@ impl Default for CommandQueueHost {
     }
 }
 
+// Implement DeviceCopy for CommandQueueHost to enable use in UnifiedBuffer
+unsafe impl cust::memory::DeviceCopy for CommandQueueHost {}
+
 // CudaClaw executor - manages the persistent kernel
 pub struct CudaClawExecutor {
     module: Module,
-    queue: UnifiedBuffer<CommandQueueHost>,
+    pub queue: UnifiedBuffer<CommandQueueHost>,  // Made public for external access
     stream: Stream,
     kernel_running: bool,
     kernel_variant: KernelVariant,
@@ -321,11 +324,12 @@ impl CudaClawExecutor {
     pub fn init_queue(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         // Launch init kernel
         let func = self.module.get_function(&CString::new("init_command_queue")?)?;
-        let mut queue_ptr = self.queue.as_device_ptr();
+        let queue_ptr = self.queue.as_device_ptr();
+        let stream = &self.stream;
 
         unsafe {
             launch!(
-                func<<<1, 1, 0, self.stream>>>(
+                func<<<1, 1, 0, stream>>>(
                     queue_ptr
                 )
             )?;
@@ -345,7 +349,8 @@ impl CudaClawExecutor {
 
         // Use the new persistent_worker kernel from executor.cu
         let func = self.module.get_function(&CString::new("persistent_worker")?)?;
-        let mut queue_ptr = self.queue.as_device_ptr();
+        let queue_ptr = self.queue.as_device_ptr();
+        let stream = &self.stream;
 
         // Launch configuration: 1 block, 256 threads
         // This keeps the kernel resident on a single Streaming Multiprocessor (SM)
@@ -353,7 +358,7 @@ impl CudaClawExecutor {
         // for future parallel processing of commands
         unsafe {
             launch!(
-                func<<<1, 256, 0, self.stream>>>(
+                func<<<1, 256, 0, stream>>>(
                     queue_ptr
                 )
             )?;
@@ -374,11 +379,12 @@ impl CudaClawExecutor {
     /// Set the polling strategy (for adaptive kernel)
     pub fn set_polling_strategy(&mut self, strategy: PollingStrategy) -> Result<(), Box<dyn std::error::Error>> {
         let func = self.module.get_function(&CString::new("set_polling_strategy")?)?;
-        let mut queue_ptr = self.queue.as_device_ptr();
+        let queue_ptr = self.queue.as_device_ptr();
+        let stream = &self.stream;
 
         unsafe {
             launch!(
-                func<<<1, 1, 0, self.stream>>>(
+                func<<<1, 1, 0, stream>>>(
                     queue_ptr,
                     strategy as u32
                 )
@@ -551,7 +557,8 @@ impl CudaClawExecutor {
     /// Get worker statistics from the GPU
     pub fn get_worker_stats(&self) -> Result<WorkerStats, Box<dyn std::error::Error>> {
         let func = self.module.get_function(&CString::new("get_worker_stats")?)?;
-        let mut queue_ptr = self.queue.as_device_ptr();
+        let queue_ptr = self.queue.as_device_ptr();
+        let stream = &self.stream;
 
         // Allocate device buffer for stats
         let mut stats_host = [0u64; 10];
@@ -559,7 +566,7 @@ impl CudaClawExecutor {
 
         unsafe {
             launch!(
-                func<<<1, 1, 0, self.stream>>>(
+                func<<<1, 1, 0, stream>>>(
                     queue_ptr,
                     stats_device.as_device_ptr()
                 )
@@ -588,7 +595,8 @@ impl CudaClawExecutor {
     /// Measure warp-level performance metrics
     pub fn measure_warp_metrics(&self) -> Result<WarpMetrics, Box<dyn std::error::Error>> {
         let func = self.module.get_function(&CString::new("measure_warp_metrics")?)?;
-        let mut queue_ptr = self.queue.as_device_ptr();
+        let queue_ptr = self.queue.as_device_ptr();
+        let stream = &self.stream;
 
         // Allocate device buffer for metrics
         let mut metrics_host = [0u32; 4];
@@ -596,7 +604,7 @@ impl CudaClawExecutor {
 
         unsafe {
             launch!(
-                func<<<1, 1, 0, self.stream>>>(
+                func<<<1, 1, 0, stream>>>(
                     queue_ptr,
                     metrics_device.as_device_ptr()
                 )

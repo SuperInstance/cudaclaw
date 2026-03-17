@@ -10,7 +10,7 @@
 // - Async/await support for non-blocking operations
 
 use cust::memory::UnifiedBuffer;
-use cuda_claw::{Command, CommandQueueHost, CommandType, QueueStatus};
+use crate::cuda_claw::{Command, CommandQueueHost, CommandType, QueueStatus};
 use std::sync::{Arc, Mutex, atomic::{AtomicU64, AtomicU32, Ordering}};
 use std::time::{Duration, Instant};
 use std::collections::VecDeque;
@@ -331,10 +331,10 @@ impl GpuDispatcher {
             let queue_size = if head >= tail {
                 head - tail
             } else {
-                (cuda_claw::QUEUE_SIZE as u32 - tail) + head
+                (crate::cuda_claw::QUEUE_SIZE as u32 - tail) + head
             };
 
-            if queue_size < cuda_claw::QUEUE_SIZE as u32 - 1 {
+            if queue_size < crate::cuda_claw::QUEUE_SIZE as u32 - 1 {
                 drop(queue);  // Release lock before writing
 
                 // Write command to queue
@@ -382,7 +382,7 @@ impl GpuDispatcher {
             let tail = queue.tail;
 
             let available_space = if head >= tail {
-                cuda_claw::QUEUE_SIZE as u32 - (head - tail)
+                crate::cuda_claw::QUEUE_SIZE as u32 - (head - tail)
             } else {
                 tail - head
             };
@@ -420,7 +420,7 @@ impl GpuDispatcher {
         let mut queue = self.queue.lock().unwrap();
         let idx = queue.head as usize;
         queue.commands[idx] = cmd;
-        queue.head = (queue.head + 1) % cuda_claw::QUEUE_SIZE as u32;
+        queue.head = (queue.head + 1) % crate::cuda_claw::QUEUE_SIZE as u32;
 
         Ok(())
     }
@@ -455,7 +455,7 @@ impl GpuDispatcher {
 
             // Check if command completed
             if queue.status == QueueStatus::Done as u32 {
-                let idx = ((queue.tail + cuda_claw::QUEUE_SIZE as u32 - 1) % cuda_claw::QUEUE_SIZE as u32) as usize;
+                let idx = ((queue.tail + crate::cuda_claw::QUEUE_SIZE as u32 - 1) % crate::cuda_claw::QUEUE_SIZE as u32) as usize;
                 let cmd = queue.commands[idx];
 
                 if cmd.id == cmd_id {
@@ -686,7 +686,7 @@ pub fn calculate_batch_stats(results: &[DispatchResult]) -> (f64, f64, f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cuda_claw::CommandQueueHost;
+    use crate::cuda_claw::CommandQueueHost;
 
     #[test]
     fn test_dispatcher_creation() {
