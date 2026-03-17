@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 # CUDA Rust bindings for GPU programming
-cust = "0.4"
+cust = "0.3"
 
 # Async runtime for host event loop
 tokio = { version = "1.42", features = ["full"] }
