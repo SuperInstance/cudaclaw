@@ -264,7 +264,7 @@ impl GpuMetricsCollector {
     fn collect_simulated(&self, elapsed_secs: f64) -> GpuMetricsSnapshot {
         // Simulate realistic-looking metrics for CI / no-GPU environments
         let t = elapsed_secs;
-        let temp = 45u32 + ((t * 0.5).sin().abs() * 10.0) as u32;
+        let temp = 45u32 + ((t * 0.5).sin().abs() * 55.0) as u32;
         let util = 80u32 + ((t * 0.3).cos().abs() * 15.0) as u32;
         GpuMetricsSnapshot {
             elapsed_secs,

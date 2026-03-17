@@ -28,7 +28,13 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 // Minimal CommandQueue types (must match src/cuda_claw.rs layout)
 // ============================================================
 
+/// Logical queue capacity for lock-free ring buffer wrap-around.
+/// Matches src/lock_free_queue.rs QUEUE_SIZE (the logical wrap-around
+/// bound used by push_command / is_queue_full).
 const QUEUE_SIZE: u32 = 16;
+
+/// Physical buffer capacity matching src/cuda_claw.rs QUEUE_SIZE.
+const BUFFER_SIZE: usize = 1024;
 
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,18 +64,23 @@ struct Command {
 
 const _: [(); std::mem::size_of::<Command>()] = [(); 48];
 
-/// Mirrors CommandQueueHost in src/cuda_claw.rs
-#[repr(C)]
+/// Mirrors CommandQueueHost in src/cuda_claw.rs (49,192 bytes, packed(4)).
+/// Field order: buffer first, then metadata — matching the production
+/// binary layout used for CUDA unified memory.
+#[repr(C, packed(4))]
 struct CommandQueueHost {
-    head:               u32,
-    tail:               u32,
-    status:             QueueStatus,
-    _pad:               u32,
-    commands:           [Command; QUEUE_SIZE as usize],
-    commands_pushed:    u64,
-    commands_popped:    u64,
-    commands_processed: u64,
+    buffer:              [Command; BUFFER_SIZE],  // offset 0,     48,992 bytes
+    status:              u32,                     // offset 48,992, 4 bytes
+    head:                u32,                     // offset 48,996, 4 bytes
+    tail:                u32,                     // offset 49,000, 4 bytes
+    is_running:          bool,                    // offset 49,004, 1 byte
+    _padding:            [u8; 3],                 // offset 49,005, 3 bytes
+    commands_sent:       u64,                     // offset 49,008, 8 bytes
+    commands_processed:  u64,                     // offset 49,016, 8 bytes
+    _stats_padding:      [u8; 8],                 // offset 49,024, 8 bytes
 }
+
+const _: [(); std::mem::size_of::<CommandQueueHost>()] = [(); 49192];
 
 // ============================================================
 // Lock-free push (mirrors src/lock_free_queue.rs)
@@ -84,7 +95,7 @@ fn push_command(queue: &mut CommandQueueHost, cmd: Command) -> bool {
             return false; // full
         }
         let index = (head % QUEUE_SIZE) as usize;
-        queue.commands[index] = cmd;
+        queue.buffer[index] = cmd;
         std::sync::atomic::fence(Ordering::SeqCst);
         let atomic = &*((&queue.head as *const u32) as *const AtomicU32);
         if atomic
@@ -92,10 +103,10 @@ fn push_command(queue: &mut CommandQueueHost, cmd: Command) -> bool {
             .is_ok()
         {
             let pushed_atomic =
-                &*((&queue.commands_pushed as *const u64) as *const AtomicU64);
+                &*((&queue.commands_sent as *const u64) as *const AtomicU64);
             pushed_atomic.fetch_add(1, Ordering::SeqCst);
-            if queue.status == QueueStatus::StatusIdle {
-                queue.status = QueueStatus::StatusReady;
+            if queue.status == QueueStatus::StatusIdle as u32 {
+                queue.status = QueueStatus::StatusReady as u32;
             }
             std::sync::atomic::fence(Ordering::SeqCst);
             return true;
@@ -112,7 +123,7 @@ fn is_queue_full(queue: &CommandQueueHost) -> bool {
 fn reset_queue(queue: &mut CommandQueueHost) {
     queue.head = 0;
     queue.tail = 0;
-    queue.status = QueueStatus::StatusIdle;
+    queue.status = QueueStatus::StatusIdle as u32;
 }
 
 // ============================================================
@@ -227,7 +238,7 @@ struct GpuSnapshot {
 impl GpuSnapshot {
     fn simulated(elapsed_secs: f64) -> Self {
         let t = elapsed_secs;
-        let temp = 45u32 + ((t * 0.5).sin().abs() * 10.0) as u32;
+        let temp = 45u32 + ((t * 0.5).sin().abs() * 55.0) as u32;
         let util = 80u32 + ((t * 0.3).cos().abs() * 15.0) as u32;
         GpuSnapshot {
             elapsed_secs,
