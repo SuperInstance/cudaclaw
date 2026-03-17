@@ -1599,12 +1599,11 @@ fn run_p99_cell_edit_benchmark() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut push_latencies_ns: Vec<u64> = Vec::with_capacity(TOTAL_EDITS);
     let mut failed_pushes: u64 = 0;
-    let mut gpu_snapshots_during_bench = Vec::new();
 
     bench_timer.start();
 
     for i in 0..TOTAL_EDITS {
-        // Collect GPU metrics periodically
+        // Collect GPU metrics periodically (stored inside gpu collector)
         if i % GPU_SAMPLE_INTERVAL == 0 && i > 0 {
             let snap = gpu.collect();
             let pct = (i * 100) / TOTAL_EDITS;
@@ -1615,7 +1614,6 @@ fn run_p99_cell_edit_benchmark() -> Result<(), Box<dyn std::error::Error>> {
             if snap.is_throttled() {
                 println!("  WARNING: GPU throttling detected at edit {}!", i);
             }
-            gpu_snapshots_during_bench.push(snap);
         }
 
         // Build a random cell-edit command

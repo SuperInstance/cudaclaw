@@ -7,18 +7,113 @@
 // latency with nanosecond precision, calculates P99, logs GPU
 // occupancy/thermal metrics, and writes latency_report.json.
 //
+// NOTE: This file is self-contained and does not import from the
+// binary crate. All required types are redefined here to match
+// the memory layout used in src/cuda_claw.rs and
+// src/lock_free_queue.rs.
+//
 // Run with:
 //   cargo test p99_cell_edit --release -- --nocapture
 //
 // ============================================================
 
-use cudaclaw::cuda_claw::{Command, CommandQueueHost, CommandType};
-use cudaclaw::lock_free_queue::LockFreeCommandQueue;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::mem::zeroed;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+// ============================================================
+// Minimal CommandQueue types (must match src/cuda_claw.rs layout)
+// ============================================================
+
+const QUEUE_SIZE: u32 = 16;
+
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum QueueStatus {
+    StatusIdle  = 0,
+    StatusReady = 1,
+    StatusDone  = 2,
+    StatusError = 3,
+}
+
+/// Mirrors Command in src/cuda_claw.rs (#[repr(C, packed(4))], 48 bytes)
+#[repr(C, packed(4))]
+#[derive(Debug, Clone, Copy)]
+struct Command {
+    cmd_type:    u32,
+    id:          u32,
+    timestamp:   u64,
+    data_a:      f32,
+    data_b:      f32,
+    result:      f32,
+    batch_data:  u64,
+    batch_count: u32,
+    _padding:    u32,
+    result_code: u32,
+}
+
+const _: [(); std::mem::size_of::<Command>()] = [(); 48];
+
+/// Mirrors CommandQueueHost in src/cuda_claw.rs
+#[repr(C)]
+struct CommandQueueHost {
+    head:               u32,
+    tail:               u32,
+    status:             QueueStatus,
+    _pad:               u32,
+    commands:           [Command; QUEUE_SIZE as usize],
+    commands_pushed:    u64,
+    commands_popped:    u64,
+    commands_processed: u64,
+}
+
+// ============================================================
+// Lock-free push (mirrors src/lock_free_queue.rs)
+// ============================================================
+
+fn push_command(queue: &mut CommandQueueHost, cmd: Command) -> bool {
+    unsafe {
+        let head = queue.head;
+        let tail = queue.tail;
+        let next_head = (head + 1) % QUEUE_SIZE;
+        if next_head == tail {
+            return false; // full
+        }
+        let index = (head % QUEUE_SIZE) as usize;
+        queue.commands[index] = cmd;
+        std::sync::atomic::fence(Ordering::SeqCst);
+        let atomic = &*((&queue.head as *const u32) as *const AtomicU32);
+        if atomic
+            .compare_exchange_weak(head, next_head, Ordering::SeqCst, Ordering::Relaxed)
+            .is_ok()
+        {
+            let pushed_atomic =
+                &*((&queue.commands_pushed as *const u64) as *const AtomicU64);
+            pushed_atomic.fetch_add(1, Ordering::SeqCst);
+            if queue.status == QueueStatus::StatusIdle {
+                queue.status = QueueStatus::StatusReady;
+            }
+            std::sync::atomic::fence(Ordering::SeqCst);
+            return true;
+        }
+        false
+    }
+}
+
+fn is_queue_full(queue: &CommandQueueHost) -> bool {
+    let next_head = (queue.head + 1) % QUEUE_SIZE;
+    next_head == queue.tail
+}
+
+fn reset_queue(queue: &mut CommandQueueHost) {
+    queue.head = 0;
+    queue.tail = 0;
+    queue.status = QueueStatus::StatusIdle;
+}
 
 // ============================================================
 // Latency Statistics
@@ -184,16 +279,15 @@ fn test_p99_cell_edit_latency_1m() {
     // 2. Warmup
     // --------------------------------------------------------
     println!("Warming up ({} edits)...", WARMUP_EDITS);
-    let bench_start = Instant::now();
 
     for i in 0..WARMUP_EDITS {
         let cmd = make_cell_edit_cmd(i, &mut rng);
-        if LockFreeCommandQueue::is_queue_full(&queue) {
-            LockFreeCommandQueue::reset_queue(&mut queue);
+        if is_queue_full(&queue) {
+            reset_queue(&mut queue);
         }
-        LockFreeCommandQueue::push_command(&mut queue, cmd);
+        push_command(&mut queue, cmd);
     }
-    LockFreeCommandQueue::reset_queue(&mut queue);
+    reset_queue(&mut queue);
     println!("Warmup complete.\n");
 
     // --------------------------------------------------------
@@ -226,13 +320,13 @@ fn test_p99_cell_edit_latency_1m() {
         let cmd = make_cell_edit_cmd(i, &mut rng);
 
         // Drain queue when full (simulate GPU consumer)
-        if LockFreeCommandQueue::is_queue_full(&queue) {
-            LockFreeCommandQueue::reset_queue(&mut queue);
+        if is_queue_full(&queue) {
+            reset_queue(&mut queue);
         }
 
         // Time the push with nanosecond precision
         let t0 = Instant::now();
-        let pushed = LockFreeCommandQueue::push_command(&mut queue, cmd);
+        let pushed = push_command(&mut queue, cmd);
         let elapsed_ns = t0.elapsed().as_nanos() as u64;
 
         if pushed {
@@ -390,7 +484,7 @@ fn test_p99_cell_edit_latency_1m() {
 
 fn make_cell_edit_cmd(i: usize, rng: &mut impl Rng) -> Command {
     Command {
-        cmd_type: CommandType::SpreadsheetEdit as u32,
+        cmd_type: 5, // CommandType::SpreadsheetEdit
         id: (i % u32::MAX as usize) as u32,
         timestamp: i as u64,
         data_a: rng.gen_range(0.0_f32..1_000_000.0),
@@ -417,11 +511,11 @@ fn test_cell_edit_latency_smoke() {
 
     for i in 0..EDITS {
         let cmd = make_cell_edit_cmd(i, &mut rng);
-        if LockFreeCommandQueue::is_queue_full(&queue) {
-            LockFreeCommandQueue::reset_queue(&mut queue);
+        if is_queue_full(&queue) {
+            reset_queue(&mut queue);
         }
         let t0 = Instant::now();
-        let pushed = LockFreeCommandQueue::push_command(&mut queue, cmd);
+        let pushed = push_command(&mut queue, cmd);
         let ns = t0.elapsed().as_nanos() as u64;
         if pushed {
             latencies_ns.push(ns);
