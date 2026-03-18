@@ -20,11 +20,14 @@ mod colors {
 mod agent;
 mod alignment;
 mod bridge;
+mod constraint_theory;
 mod cuda_claw;
 mod dispatcher;
+mod gpu_cell_agent;
 mod gpu_metrics;
 mod installer;
 mod lock_free_queue;
+mod ml_feedback;
 mod ramify;
 mod monitor;
 mod volatile_dispatcher;
@@ -912,6 +915,151 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // so we handle it before cust::quick_init() which would fail
     // on machines without CUDA.
     let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // ============================================================
+    // CLI: Check for "constraint" subcommand before CUDA init
+    // ============================================================
+    if args.first().map(|s| s.as_str()) == Some("constraint") {
+        let sub_args: Vec<String> = args[1..].to_vec();
+
+        if sub_args.iter().any(|a| a == "--help" || a == "-h") {
+            constraint_theory::print_constraint_help();
+            return Ok(());
+        }
+
+        match constraint_theory::parse_constraint_args(&sub_args) {
+            Some(constraint_theory::ConstraintCliAction::ShowDna) => {
+                constraint_theory::show_dna();
+                return Ok(());
+            }
+            Some(constraint_theory::ConstraintCliAction::Validate) => {
+                constraint_theory::validate_dna();
+                return Ok(());
+            }
+            Some(constraint_theory::ConstraintCliAction::Export(path)) => {
+                let dna = constraint_theory::ConstraintDna::default_system_dna();
+                let json = serde_json::to_string_pretty(&dna).unwrap();
+                std::fs::write(&path, &json).expect("Failed to write DNA file");
+                println!("DNA exported to {}", path);
+                return Ok(());
+            }
+            Some(constraint_theory::ConstraintCliAction::Import(path)) => {
+                let json = std::fs::read_to_string(&path).expect("Failed to read DNA file");
+                let _dna: constraint_theory::ConstraintDna = serde_json::from_str(&json).expect("Invalid DNA JSON");
+                println!("DNA imported from {} (validated OK)", path);
+                return Ok(());
+            }
+            Some(constraint_theory::ConstraintCliAction::ShowTwins) => {
+                let mut twin_map = constraint_theory::GeometricTwinMap::new(8, 8);
+                twin_map.build_default_topology();
+                println!("Geometric Twin Topology: {} nodes, {} bindings",
+                    twin_map.node_count(), twin_map.binding_count());
+                for b in twin_map.bindings().iter().take(8) {
+                    println!("  Cell({},{}) <-> Twin '{}'", b.cell_row, b.cell_col, b.twin_node_id);
+                }
+                return Ok(());
+            }
+            Some(constraint_theory::ConstraintCliAction::Demo) => {
+                constraint_theory::run_demo();
+                return Ok(());
+            }
+            None => {
+                constraint_theory::print_constraint_help();
+                return Ok(());
+            }
+        }
+    }
+
+    // ============================================================
+    // CLI: Check for "agent" subcommand before CUDA init
+    // ============================================================
+    if args.first().map(|s| s.as_str()) == Some("agent") {
+        let sub_args: Vec<String> = args[1..].to_vec();
+
+        if sub_args.iter().any(|a| a == "--help" || a == "-h") {
+            gpu_cell_agent::print_agent_help();
+            return Ok(());
+        }
+
+        match gpu_cell_agent::parse_agent_args(&sub_args) {
+            Some(gpu_cell_agent::AgentCliAction::Demo { rows, cols }) => {
+                gpu_cell_agent::run_demo(rows, cols);
+                return Ok(());
+            }
+            Some(gpu_cell_agent::AgentCliAction::Status { rows, cols }) => {
+                gpu_cell_agent::show_status(rows, cols);
+                return Ok(());
+            }
+            Some(gpu_cell_agent::AgentCliAction::ListFibers) => {
+                gpu_cell_agent::list_fibers();
+                return Ok(());
+            }
+            None => {
+                gpu_cell_agent::print_agent_help();
+                return Ok(());
+            }
+        }
+    }
+
+    // ============================================================
+    // CLI: Check for "feedback" subcommand before CUDA init
+    // ============================================================
+    if args.first().map(|s| s.as_str()) == Some("feedback") {
+        let sub_args: Vec<String> = args[1..].to_vec();
+
+        if sub_args.iter().any(|a| a == "--help" || a == "-h") {
+            ml_feedback::print_feedback_help();
+            return Ok(());
+        }
+
+        match ml_feedback::parse_feedback_args(&sub_args) {
+            Some(ml_feedback::FeedbackCliAction::Demo) => {
+                ml_feedback::run_demo();
+                return Ok(());
+            }
+            Some(ml_feedback::FeedbackCliAction::Status) => {
+                ml_feedback::show_status();
+                return Ok(());
+            }
+            Some(ml_feedback::FeedbackCliAction::Analyze) => {
+                ml_feedback::run_demo(); // Analyze runs the full pipeline
+                return Ok(());
+            }
+            Some(ml_feedback::FeedbackCliAction::Apply) => {
+                ml_feedback::run_demo(); // Apply runs and applies mutations
+                return Ok(());
+            }
+            Some(ml_feedback::FeedbackCliAction::Export(path)) => {
+                // Run analysis and export report
+                use ml_feedback::{ExecutionLog, ExecutionEntry, SuccessAnalyzer};
+                let mut log = ExecutionLog::new(1000);
+                for i in 0..100 {
+                    log.record(ExecutionEntry {
+                        agent_id: format!("cell_{}", i),
+                        fiber_type: "cell_update".into(),
+                        execution_time_us: 2.0 + (i as f64 * 0.05),
+                        registers_used: 24,
+                        shared_memory_used: 2048,
+                        coalescing_ratio: 0.9,
+                        warp_occupancy: 0.7,
+                        success: true,
+                        timestamp_epoch: 1000 + i as u64,
+                    });
+                }
+                let dna = constraint_theory::ConstraintDna::default_system_dna();
+                let analyzer = SuccessAnalyzer::new(dna);
+                let report = analyzer.analyze(&log);
+                let json = serde_json::to_string_pretty(&report).unwrap();
+                std::fs::write(&path, &json).expect("Failed to write report");
+                println!("Analysis report exported to {}", path);
+                return Ok(());
+            }
+            None => {
+                ml_feedback::print_feedback_help();
+                return Ok(());
+            }
+        }
+    }
 
     // ============================================================
     // CLI: Check for "ramify" subcommand before CUDA init

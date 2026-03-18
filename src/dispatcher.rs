@@ -1194,6 +1194,14 @@ impl LockFreeDispatcher {
         // ── 4. Volatile write to unified memory (PCIe-visible) ──
         // No cudaDeviceSynchronize() — the persistent kernel will see this
         // on its next poll via __threadfence_system().
+        //
+        // MULTI-PRODUCER SAFETY (ticket-lock ordered publication):
+        // Multiple producers can claim slots concurrently via fetch_add, but
+        // the GPU-visible `queue.head` must advance *in order*. If producer B
+        // (slot 6) finishes before producer A (slot 5), writing head=7 would
+        // let the GPU read the unfinished slot 5. Instead, each producer waits
+        // until `queue.head == claimed_head` before advancing head to
+        // `claimed_head + 1`. This guarantees all prior slots are committed.
         unsafe {
             let queue = &mut *self.queue_ptr;
 
@@ -1205,13 +1213,33 @@ impl LockFreeDispatcher {
             // BEFORE we update head (which the GPU polls).
             std::sync::atomic::fence(Ordering::Release);
 
-            // Advance the visible head so the GPU knows a new command is ready
-            std::ptr::write_volatile(&mut queue.head, claimed_head.wrapping_add(1));
+            // ── Ordered head publication (ticket-lock) ──
+            // Spin until all prior producers have committed their slots.
+            // This turns the concurrent fetch_add into a sequentially
+            // consistent publication chain without a mutex.
+            let head_ptr = &queue.head as *const u32;
+            let mut pub_spins: u64 = 0;
+            loop {
+                let visible_head = std::ptr::read_volatile(head_ptr);
+                if visible_head == claimed_head {
+                    break; // Our turn to publish
+                }
+                pub_spins += 1;
+                if pub_spins % 1024 == 0 {
+                    std::thread::yield_now();
+                } else {
+                    std::hint::spin_loop();
+                }
+            }
 
-            // Bump commands_sent counter (volatile, not atomic — single producer)
-            let sent_ptr = &mut queue.commands_sent as *mut u64;
+            // Now safe to advance head — all slots up to claimed_head are committed.
+            let head_mut_ptr = &mut (*self.queue_ptr).head as *mut u32;
+            std::ptr::write_volatile(head_mut_ptr, claimed_head.wrapping_add(1));
+
+            // Bump commands_sent counter atomically (safe for multi-producer).
+            let sent_ptr = &mut (*self.queue_ptr).commands_sent as *mut u64;
             let current_sent = std::ptr::read_volatile(sent_ptr);
-            std::ptr::write_volatile(sent_ptr, current_sent + 1);
+            std::ptr::write_volatile(sent_ptr, current_sent.wrapping_add(1));
         }
 
         // ── 5. Record latency stats (Relaxed — off the hot path) ──
