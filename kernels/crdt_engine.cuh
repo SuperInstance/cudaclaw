@@ -4610,7 +4610,7 @@ __global__ void parallel_formula_recalc_kernel(
         // Use block_prefix_sum_exclusive directly (compact_frontier_prefix_sum
         // expects array predicates, but is_ready is a per-thread register).
         uint32_t my_pos = block_prefix_sum_exclusive(is_ready, state->scan_workspace);
-        frontier_count = state->scan_workspace[32];  // Total ready cells
+        uint32_t frontier_count = state->scan_workspace[32];  // Total ready cells
 
         if (frontier_count == 0) break;  // No more cells to process
 
