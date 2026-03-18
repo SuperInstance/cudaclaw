@@ -391,7 +391,12 @@ extern "C" __global__ void persistent_worker(CommandQueue* queue) {
         // ============================================================
         if (lane_id == 0) {
             uint32_t tail = queue->tail;
-            queue->tail = (tail + 1) % QUEUE_SIZE;
+            // Use monotonic (unwrapped) tail to match the host's monotonic
+            // head counter. Buffer indexing uses tail % QUEUE_SIZE (already
+            // done at line 231). Without this, after QUEUE_SIZE commands
+            // the wrapped tail (0) != monotonic head (1024+), causing the
+            // GPU to replay stale commands indefinitely. (BUG_0001 fix)
+            queue->tail = tail + 1;
             queue->commands_processed++;
 
             // Memory fence so CPU sees our tail update immediately.

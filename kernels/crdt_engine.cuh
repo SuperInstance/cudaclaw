@@ -3184,6 +3184,14 @@ __device__ void load_working_set(
             uint32_t dirty_row = sorted_dirty[d] / crdt->cols;
             // Load all columns in this row cooperatively
             for (uint32_t c = tid; c < crdt->cols; c += bdim) {
+                // BUG_0003 fix: Check capacity BEFORE atomicAdd to avoid
+                // claiming phantom slots that will never be filled. Reading
+                // loaded_counter without atomicAdd is racy but conservative:
+                // threads may see a slightly stale value and break a few
+                // iterations early, which is safe (no data corruption).
+                uint32_t current = loaded_counter;  // relaxed read
+                if (base + current >= AWS_MAX_CELLS) break;
+
                 uint32_t slot = atomicAdd(&loaded_counter, 1U);
                 if (base + slot >= AWS_MAX_CELLS) break;
                 uint32_t global_idx = dirty_row * crdt->cols + c;
