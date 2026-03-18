@@ -477,22 +477,21 @@ impl Installer {
         // Update muscle fibers from the winning suggestion
         self.apply_suggestion_to_fibers(&mut dna, suggestion, micro_result);
 
-        // If NVRTC compilation is available, store the compiled PTX
-        // in the winning fiber's kernel_source so it can be loaded
-        // at runtime without recompilation.
+        // If NVRTC compilation is available AND it was a real (not simulated)
+        // compilation, store the compiled PTX in the winning fiber's kernel_source
+        // so it can be loaded at runtime without recompilation.
+        // Simulated artifacts are non-executable scaffolds and must NOT overwrite
+        // existing kernel sources.
         if let Some(compilation) = nvrtc_compilation {
-            // Store NVRTC-compiled PTX in the cell_update fiber
-            // (the primary persistent-worker kernel)
-            if let Some(fiber) = dna.muscle_fibers.get_mut("cell_update") {
-                fiber.kernel_source = crate::dna::DnaKernelSource::NvrtcSource {
-                    source: compilation.compilation.ptx.clone(),
-                    program_name: format!("muscle_{}.cu", compilation.suggestion_id),
-                    gpu_arch: compilation.target_arch.clone(),
-                    defines: compilation.injected_constants.clone(),
-                    extra_flags: Vec::new(),
-                    max_registers: 0,
-                    use_fast_math: false,
-                };
+            if !compilation.simulated {
+                // Store compiled PTX using the Ptx variant so runtime.rs loads it
+                // directly without attempting to re-compile it via NVRTC.
+                if let Some(fiber) = dna.muscle_fibers.get_mut("cell_update") {
+                    fiber.kernel_source = crate::dna::DnaKernelSource::Ptx {
+                        ptx: compilation.compilation.ptx.clone(),
+                        target_arch: compilation.target_arch.replace("compute_", "sm_"),
+                    };
+                }
             }
         }
 
