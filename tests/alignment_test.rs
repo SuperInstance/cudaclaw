@@ -13,7 +13,7 @@ macro_rules! offset_of {
     }};
 }
 
-#[repr(C, packed(4))]
+#[repr(C, packed(8))]
 #[derive(Debug, Clone, Copy)]
 struct Command {
     pub cmd_type: u32,
@@ -30,7 +30,7 @@ struct Command {
 
 const QUEUE_SIZE: usize = 1024;
 
-#[repr(C, packed(4))]
+#[repr(C, packed(8))]
 #[derive(Clone, Copy)]
 struct CommandQueueHost {
     pub buffer: [Command; QUEUE_SIZE],

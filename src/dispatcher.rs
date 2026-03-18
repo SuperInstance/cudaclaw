@@ -652,14 +652,14 @@ impl AsyncGpuDispatcher {
 /// Create a simple add command for testing
 pub fn create_add_command(a: f32, b: f32) -> Command {
     Command::new(CommandType::Add, 0)
-        .with_add_data(a, b)
+        .with_data(a as f64, b as f64)
 }
 
 /// Create a batch of add commands
 pub fn create_add_batch(pairs: Vec<(f32, f32)>) -> Vec<Command> {
     pairs.into_iter()
         .enumerate()
-        .map(|(i, (a, b))| Command::new(CommandType::Add, i as u32).with_add_data(a, b))
+        .map(|(i, (a, b))| Command::new(CommandType::Add, i as u32).with_data(a as f64, b as f64))
         .collect()
 }
 
@@ -1706,8 +1706,10 @@ mod tests {
     fn test_create_add_command() {
         let cmd = create_add_command(1.0, 2.0);
         assert_eq!(cmd.cmd_type, CommandType::Add as u32);
-        assert_eq!(cmd.data_a, 1.0);
-        assert_eq!(cmd.data_b, 2.0);
+        let data_a = cmd.data_a;
+        let data_b = cmd.data_b;
+        assert_eq!(data_a, 1.0);
+        assert_eq!(data_b, 2.0);
     }
 
     #[test]
@@ -1716,9 +1718,12 @@ mod tests {
         let commands = create_add_batch(pairs);
 
         assert_eq!(commands.len(), 3);
-        assert_eq!(commands[0].data_a, 1.0);
-        assert_eq!(commands[1].data_a, 3.0);
-        assert_eq!(commands[2].data_a, 5.0);
+        let data_a_0 = commands[0].data_a;
+        assert_eq!(data_a_0, 1.0);
+        let data_a_1 = commands[1].data_a;
+        assert_eq!(data_a_1, 3.0);
+        let data_a_2 = commands[2].data_a;
+        assert_eq!(data_a_2, 5.0);
     }
 
     #[test]

@@ -1332,7 +1332,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Run full installer pipeline
         if let Some(config) = installer::parse_installer_args(&args) {
             let inst = installer::Installer::new(config);
-            let (profile, path) = inst.run().await?;
+            let (profile, path): (installer::role_profile::RoleProfile, std::path::PathBuf) = inst.run().await?;
             println!("Installer complete. Profile saved to: {}", path.display());
             println!("Role: {}, Score: {:.1}, P99 RTT: {:.2} µs",
                 profile.role_name, profile.best_score, profile.achieved_p99_rtt_us);
@@ -1755,7 +1755,7 @@ fn run_spinlock_benchmark() -> Result<(), Box<dyn std::error::Error>> {
         num_commands: 10_000,
         warmup_iterations: 1_000,
         target_latency_ns: 5_000, // 5 microseconds
-        command_type: cuda_claw::CommandType::Noop,
+        command_type: cuda_claw::CommandType::NoOp,
         detailed_stats: true,
     };
 
@@ -2009,13 +2009,11 @@ fn run_p99_cell_edit_benchmark() -> Result<(), Box<dyn std::error::Error>> {
             cmd_type: CommandType::SpreadsheetEdit as u32,
             id: (i % u32::MAX as usize) as u32,
             timestamp: i as u64,
-            data_a: rng.gen_range(0.0_f32..1_000_000.0),
-            data_b: rng.gen_range(0.0_f32..1_000_000.0),
+            data_a: rng.gen_range(0.0..1_000_000.0) as f64,
+            data_b: rng.gen_range(0.0..1_000_000.0) as f64,
             result: 0.0,
             batch_data: rng.gen::<u64>(),
-            batch_count: 1,
-            _padding: 0,
-            result_code: 0,
+
         };
 
         // Drain the queue when full (simulate consumer)
@@ -2058,13 +2056,11 @@ fn run_p99_cell_edit_benchmark() -> Result<(), Box<dyn std::error::Error>> {
             cmd_type: CommandType::SpreadsheetEdit as u32,
             id: (i % u32::MAX as usize) as u32,
             timestamp: i as u64,
-            data_a: rng.gen_range(0.0_f32..1_000_000.0),
-            data_b: rng.gen_range(0.0_f32..1_000_000.0),
+            data_a: rng.gen_range(0.0..1_000_000.0) as f64,
+            data_b: rng.gen_range(0.0..1_000_000.0) as f64,
             result: 0.0,
             batch_data: rng.gen::<u64>(),
-            batch_count: 1,
-            _padding: 0,
-            result_code: 0,
+
         };
 
         // Drain queue when full (simulate GPU consumer)
