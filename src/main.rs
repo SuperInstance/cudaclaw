@@ -32,6 +32,7 @@ mod ml_feedback;
 mod ramify;
 mod ramify_monitor;
 mod runtime;
+mod spreadsheet_bridge;
 mod monitor;
 mod volatile_dispatcher;
 
@@ -1219,6 +1220,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             Some(runtime::RuntimeCliAction::Help) | None => {
                 runtime::print_runtime_help();
+                return Ok(());
+            }
+        }
+    }
+
+    // ============================================================
+    // CLI: Check for "spreadsheet" subcommand before CUDA init
+    // ============================================================
+    // The Spreadsheet Bridge maps cells to Cudaclaw Roots,
+    // harvests formula patterns, checks fiber efficiency,
+    // and triggers Ramification events for parallel recalculation.
+    if args.first().map(|s| s.as_str()) == Some("spreadsheet") {
+        let sub_args: Vec<String> = args[1..].to_vec();
+
+        if sub_args.iter().any(|a| a == "--help" || a == "-h") {
+            spreadsheet_bridge::print_spreadsheet_help();
+            return Ok(());
+        }
+
+        match spreadsheet_bridge::parse_spreadsheet_args(&sub_args) {
+            Some(spreadsheet_bridge::SpreadsheetCliAction::Demo) => {
+                spreadsheet_bridge::run_demo();
+                return Ok(());
+            }
+            Some(spreadsheet_bridge::SpreadsheetCliAction::Status) => {
+                spreadsheet_bridge::show_status();
+                return Ok(());
+            }
+            Some(spreadsheet_bridge::SpreadsheetCliAction::Export(path)) => {
+                let mut bridge = spreadsheet_bridge::SpreadsheetBridge::new(16, 16);
+                // Run a few sample operations so the export has data.
+                bridge.on_cell_edit(0, 0, 42.0);
+                bridge.register_formula(1, 0, "=SUM(A1:A16)");
+                let _ = bridge.tick();
+                match bridge.export_report(&path) {
+                    Ok(()) => println!("Bridge report exported to {}", path),
+                    Err(e) => eprintln!("Export failed: {}", e),
+                }
+                return Ok(());
+            }
+            Some(spreadsheet_bridge::SpreadsheetCliAction::Help) | None => {
+                spreadsheet_bridge::print_spreadsheet_help();
                 return Ok(());
             }
         }
