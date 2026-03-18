@@ -484,25 +484,40 @@ impl Installer {
         // existing kernel sources.
         if let Some(compilation) = nvrtc_compilation {
             if !compilation.simulated {
-                // Only store PTX when the compiled entry point matches the
-                // fiber's expected kernel symbol. The generated muscle kernel
-                // uses "persistent_worker_muscle" — the cell_update fiber
-                // expects this exact entry. If the names diverge (e.g., a
-                // future refactor renames the entry), we skip the update and
-                // record a note rather than binding an incompatible PTX blob.
-                const CELL_UPDATE_ENTRY: &str = "persistent_worker_muscle";
-                if compilation.entry_point == CELL_UPDATE_ENTRY {
-                    if let Some(fiber) = dna.muscle_fibers.get_mut("cell_update") {
+                // Route the compiled PTX to the fiber whose kernel contract
+                // matches the entry point.  The NVRTC muscle compiler always
+                // generates `persistent_worker_muscle` — this is the
+                // persistent polling kernel, which maps to the `idle_poll`
+                // fiber (block_size=32, is_persistent=true).  Storing it in
+                // `cell_update` would replace a per-cell-update kernel with
+                // an incompatible persistent-worker entry, so we route by
+                // entry point name instead.
+                let target_fiber = match compilation.entry_point.as_str() {
+                    "persistent_worker_muscle" => Some("idle_poll"),
+                    // Future: add mappings for other compiled entry points
+                    // e.g. "cell_update_muscle" => Some("cell_update"),
+                    _ => None,
+                };
+
+                if let Some(fiber_key) = target_fiber {
+                    if let Some(fiber) = dna.muscle_fibers.get_mut(fiber_key) {
                         fiber.kernel_source = crate::dna::DnaKernelSource::Ptx {
                             ptx: compilation.compilation.ptx.clone(),
                             target_arch: compilation.target_arch.replace("compute_", "sm_"),
                         };
+                        println!(
+                            "    [DNA] Stored compiled PTX in '{}' fiber \
+                             (entry='{}', {} bytes)",
+                            fiber_key,
+                            compilation.entry_point,
+                            compilation.compilation.ptx.len()
+                        );
                     }
                 } else {
                     println!(
-                        "    [DNA] Skipping PTX storage: entry '{}' does not match \
-                         expected '{}' for cell_update fiber",
-                        compilation.entry_point, CELL_UPDATE_ENTRY
+                        "    [DNA] Skipping PTX storage: no fiber mapping for \
+                         entry point '{}'",
+                        compilation.entry_point
                     );
                 }
             }
