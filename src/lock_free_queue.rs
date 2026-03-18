@@ -98,8 +98,8 @@ unsafe fn atomic_fetch_add_u64(ptr: *const u64, value: u64) -> u64 {
 // Queue State Management
 /// ============================================================
 
-/// Queue capacity (must match QUEUE_SIZE in CUDA)
-pub const QUEUE_SIZE: u32 = 16;
+/// Queue capacity (must match QUEUE_SIZE in CUDA and cuda_claw.rs)
+pub const QUEUE_SIZE: u32 = 1024;
 
 /// Queue states for synchronization
 #[derive(Debug, Clone, Copy, PartialEq)]

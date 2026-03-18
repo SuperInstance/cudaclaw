@@ -4158,7 +4158,15 @@ __device__ bool soa_write_cell_ptx(
                 if (compare_timestamps(recheck_ts, recheck_node, timestamp, node_id)) {
                     // The concurrent write has higher priority.
                     // Roll back: CAS the value back to the old bits.
-                    ptx_atom_cas_b64(val_ptr, new_bits, cur_bits);
+                    unsigned long long rollback = ptx_atom_cas_b64(val_ptr, new_bits, cur_bits);
+                    if (rollback != new_bits) {
+                        // Rollback CAS failed: a third writer overwrote our value.
+                        // The cell now has (third_writer's_value, unknown_metadata).
+                        // We must NOT write our metadata. Retry from scratch so the
+                        // spin loop re-reads the current state and tries again.
+                        spins++;
+                        continue;
+                    }
                     return false;
                 }
                 // Our write still has higher priority — proceed.
@@ -4183,10 +4191,20 @@ __device__ bool soa_write_cell_ptx(
 
             ptx_membar_gpu();  // Publish all fields
 
-            // Post-write ownership check: if a higher-priority concurrent
-            // writer overwrote our value between our CAS and metadata writes,
-            // our metadata is stale but harmless — the concurrent writer will
-            // overwrite our metadata with its own atomic stores.
+            // Post-write verification: re-read the value to confirm we
+            // still own the cell. If a concurrent writer overwrote us
+            // between our value CAS and metadata writes, our metadata
+            // is now stale. In that case, don't count this as our update
+            // — the concurrent writer will fix the metadata.
+            unsigned long long final_val;
+            memcpy(&final_val, &grid->values[flat_idx], sizeof(unsigned long long));
+            if (final_val != new_bits) {
+                // Another writer overwrote our value — our metadata writes
+                // are stale but will be corrected by the concurrent writer's
+                // metadata atomicExch calls. Do not count as our success.
+                grid->inc_conflict();
+                return false;
+            }
 
             grid->inc_version();
             grid->inc_update();

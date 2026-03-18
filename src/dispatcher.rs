@@ -423,7 +423,7 @@ impl GpuDispatcher {
     /// Write command to unified memory queue
     fn write_command_to_queue(&self, cmd: Command) -> Result<(), Box<dyn std::error::Error>> {
         let mut queue = self.queue.lock().unwrap();
-        let idx = queue.head as usize;
+        let idx = (queue.head % crate::cuda_claw::QUEUE_SIZE as u32) as usize;
         queue.buffer[idx] = cmd;
         queue.head = (queue.head + 1) % crate::cuda_claw::QUEUE_SIZE as u32;
 
