@@ -30,47 +30,47 @@ fn main() {
 
         // Compile each .cu file to .ptx
         for cu_file in cu_files {
-        let cu_path = cu_file.path();
-        let ptx_name = cu_path
-            .file_stem()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_string() + ".ptx";
-        let ptx_path = out_dir.join(&ptx_name);
+            let cu_path = cu_file.path();
+            let ptx_name = cu_path
+                .file_stem()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string() + ".ptx";
+            let ptx_path = out_dir.join(&ptx_name);
 
-        println!("cargo:warning=Compiling CUDA kernel: {:?}", cu_path);
+            println!("cargo:warning=Compiling CUDA kernel: {:?}", cu_path);
 
-        // Find VS 2019 Build Tools compiler
-        let compiler_bindir = "C:\\Program Files (x86)\\Microsoft Visual Studio\\2019\\BuildTools\\VC\\Tools\\MSVC\\14.29.30133\\bin\\HostX64\\x64";
+            // Find VS 2019 Build Tools compiler
+            let compiler_bindir = "C:\\Program Files (x86)\\Microsoft Visual Studio\\2019\\BuildTools\\VC\\Tools\\MSVC\\14.29.30133\\bin\\HostX64\\x64";
 
-        let output = Command::new("nvcc")
-            .arg("-ptx")
-            .arg(&cu_path)
-            .arg("-o")
-            .arg(&ptx_path)
-            .arg("--compiler-bindir")
-            .arg(compiler_bindir)
-            .arg("-std=c++14")  // Required for atomic operations
-            .arg("-Xcompiler").arg("/wd4819")  // Suppress warnings about charset
-            .output();
+            let output = Command::new("nvcc")
+                .arg("-ptx")
+                .arg(&cu_path)
+                .arg("-o")
+                .arg(&ptx_path)
+                .arg("--compiler-bindir")
+                .arg(compiler_bindir)
+                .arg("-std=c++14")  // Required for atomic operations
+                .arg("-Xcompiler").arg("/wd4819")  // Suppress warnings about charset
+                .output();
 
-        match output {
-            Ok(o) if o.status.success() => {
-                println!("cargo:warning=Successfully compiled {:?}", cu_path);
+            match output {
+                Ok(o) if o.status.success() => {
+                    println!("cargo:warning=Successfully compiled {:?}", cu_path);
+                }
+                Ok(o) => {
+                    let stderr = String::from_utf8_lossy(&o.stderr);
+                    panic!(
+                        "nvcc failed to compile {:?}:\n{}",
+                        cu_path,
+                        stderr
+                    );
+                }
+                Err(e) => {
+                    panic!("Failed to execute nvcc: {}. Ensure CUDA toolkit is installed and nvcc is in PATH", e);
+                }
             }
-            Ok(o) => {
-                let stderr = String::from_utf8_lossy(&o.stderr);
-                panic!(
-                    "nvcc failed to compile {:?}:\n{}",
-                    cu_path,
-                    stderr
-                );
-            }
-            Err(e) => {
-                panic!("Failed to execute nvcc: {}. Ensure CUDA toolkit is installed and nvcc is in PATH", e);
-            }
-        }
 
             // Tell cargo to rerun if the .cu file changes
             println!("cargo:rerun-if-changed={}", cu_path.display());

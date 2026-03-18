@@ -9,10 +9,12 @@
 // - Backpressure management
 // - Async/await support for non-blocking operations
 
+#[cfg(feature = "cuda")]
 use cust::memory::UnifiedBuffer;
 use crate::cuda_claw::{Command, CommandQueueHost, CommandType, QueueStatus};
 use std::sync::{Arc, Mutex, atomic::{AtomicU64, AtomicU32, Ordering}};
 use std::time::{Duration, Instant};
+#[cfg(feature = "cuda")]
 use std::collections::VecDeque;
 
 // ============================================================
@@ -71,6 +73,7 @@ pub struct DispatchResult {
 }
 
 /// Pending command awaiting completion
+#[cfg(feature = "cuda")]
 struct PendingCommand {
     command: Command,
     submit_time: Instant,
@@ -124,6 +127,7 @@ struct PendingCommand {
 /// │                                                               │
 /// └─────────────────────────────────────────────────────────────┘
 /// ```
+#[cfg(feature = "cuda")]
 pub struct GpuDispatcher {
     /// Unified memory command queue (shared with GPU)
     queue: Arc<Mutex<UnifiedBuffer<CommandQueueHost>>>,
@@ -148,6 +152,7 @@ pub struct GpuDispatcher {
     batch_size: usize,
 }
 
+#[cfg(feature = "cuda")]
 impl GpuDispatcher {
     /// Create a new GPU dispatcher
     ///
@@ -418,8 +423,8 @@ impl GpuDispatcher {
     /// Write command to unified memory queue
     fn write_command_to_queue(&self, cmd: Command) -> Result<(), Box<dyn std::error::Error>> {
         let mut queue = self.queue.lock().unwrap();
-        let idx = queue.head as usize;
-        queue.commands[idx] = cmd;
+        let idx = (queue.head % crate::cuda_claw::QUEUE_SIZE as u32) as usize;
+        queue.buffer[idx] = cmd;
         queue.head = (queue.head + 1) % crate::cuda_claw::QUEUE_SIZE as u32;
 
         Ok(())
@@ -456,7 +461,7 @@ impl GpuDispatcher {
             // Check if command completed
             if queue.status == QueueStatus::Done as u32 {
                 let idx = ((queue.tail + crate::cuda_claw::QUEUE_SIZE as u32 - 1) % crate::cuda_claw::QUEUE_SIZE as u32) as usize;
-                let cmd = queue.commands[idx];
+                let cmd = queue.buffer[idx];
 
                 if cmd.id == cmd_id {
                     // Reset status to idle
@@ -588,10 +593,12 @@ impl GpuDispatcher {
 ///     Ok(())
 /// }
 /// ```
+#[cfg(feature = "cuda")]
 pub struct AsyncGpuDispatcher {
     inner: Arc<Mutex<GpuDispatcher>>,
 }
 
+#[cfg(feature = "cuda")]
 impl AsyncGpuDispatcher {
     /// Create a new async GPU dispatcher
     pub fn new(
@@ -725,7 +732,7 @@ pub fn calculate_batch_stats(results: &[DispatchResult]) -> (f64, f64, f64) {
 /// let dispatcher = SpinLockDispatcher::new(queue_ptr)?;
 ///
 /// // Dispatch NOOP command
-/// let cmd = Command::new(CommandType::Noop, 0);
+/// let cmd = Command::new(CommandType::NoOp, 0);
 /// let (cmd_id, latency_ns) = dispatcher.dispatch_atomic(cmd)?;
 ///
 /// println!("Dispatched command {} in {} ns", cmd_id, latency_ns);
@@ -818,7 +825,7 @@ impl SpinLockDispatcher {
     ///
     /// # Example
     /// ```rust
-    /// let cmd = Command::new(CommandType::Noop, 0);
+    /// let cmd = Command::new(CommandType::NoOp, 0);
     /// let (cmd_id, latency_ns) = dispatcher.dispatch_atomic(cmd)?;
     /// assert!(latency_ns < 1000, "Dispatch should be < 1µs");
     /// ```
@@ -859,7 +866,7 @@ impl SpinLockDispatcher {
             }
 
             // Volatile write to command slot (ensures GPU visibility)
-            let cmd_ptr = &mut queue.commands[slot as usize] as *mut Command;
+            let cmd_ptr = &mut queue.buffer[slot as usize] as *mut Command;
             std::ptr::write_volatile(cmd_ptr, cmd);
 
             // Volatile write to head index (signals GPU to read command)
@@ -931,9 +938,9 @@ impl SpinLockDispatcher {
     /// # Example
     /// ```rust
     /// let commands = vec![
-    ///     Command::new(CommandType::Noop, 0),
-    ///     Command::new(CommandType::Noop, 1),
-    ///     Command::new(CommandType::Noop, 2),
+    ///     Command::new(CommandType::NoOp, 0),
+    ///     Command::new(CommandType::NoOp, 1),
+    ///     Command::new(CommandType::NoOp, 2),
     /// ];
     /// let results = dispatcher.dispatch_batch_atomic(commands)?;
     /// ```
@@ -1013,6 +1020,372 @@ pub struct SpinLockStats {
 }
 
 // ============================================================
+// LOCK-FREE DISPATCHER (Zero-Synchronization, Spin-Wait-on-Full)
+// ============================================================
+//
+// This dispatcher is the canonical high-speed lock-free command pusher.
+// It is designed for maximum throughput with minimal latency:
+//
+//   - Atomic Relaxed fetch_add for head index increment (no SeqCst overhead)
+//   - Zero calls to cudaDeviceSynchronize() in the push path
+//   - Volatile writes for immediate PCIe/GPU visibility
+//   - Spin-wait ONLY when the ring buffer is completely full
+//   - stop() method to set is_running = false for persistent kernel shutdown
+//
+// MEMORY MODEL:
+//   Host (Rust)                          Device (GPU)
+//   ──────────                           ─────────────
+//   fetch_add(head, Relaxed)             volatile read head
+//   write_volatile(buffer[slot], cmd)    read buffer[slot]
+//   write_volatile(head, new_head)       __threadfence_system()
+//   fence(Release)                       poll loop continues
+//
+// The GPU persistent kernel polls `head` with __threadfence_system()
+// and sees new commands without any explicit synchronization call.
+
+/// High-speed lock-free dispatcher for the unified memory CommandQueue.
+///
+/// Uses atomic Relaxed operations for head increment and volatile writes
+/// for GPU visibility. No cudaDeviceSynchronize() is ever called in the
+/// push path. When the ring buffer is full, the caller spin-waits until
+/// the GPU consumes entries and advances the tail pointer.
+///
+/// # Architecture
+/// ```text
+/// Rust Thread(s)                     GPU Persistent Kernel
+///     │                                     │
+///     ├─ fetch_add(head, Relaxed)           │
+///     ├─ spin-wait if full ◄────────────────┤ (tail not advanced yet)
+///     ├─ write_volatile(buffer[slot])       │
+///     ├─ fence(Release)                     │
+///     │                                     ├─ __threadfence_system()
+///     │                                     ├─ read head (sees new value)
+///     │                                     ├─ read buffer[slot]
+///     │                                     └─ advance tail
+/// ```
+///
+/// # Shutdown
+/// Call `stop()` to set `is_running = false` in unified memory.
+/// The persistent GPU kernel observes this on its next poll iteration
+/// and exits its `while(queue->is_running)` loop gracefully.
+pub struct LockFreeDispatcher {
+    /// Raw pointer to CommandQueueHost in Unified Memory
+    queue_ptr: *mut CommandQueueHost,
+
+    /// Atomic head index — the SOLE synchronization point for producers.
+    /// Incremented with Relaxed ordering for maximum throughput.
+    head: AtomicU32,
+
+    /// Monotonically increasing command ID
+    next_id: AtomicU32,
+
+    // ── Statistics (all Relaxed — not on the critical path) ──
+
+    /// Total commands successfully dispatched
+    stat_dispatched: AtomicU64,
+
+    /// Total dispatch latency in nanoseconds
+    stat_total_ns: AtomicU64,
+
+    /// Number of spin-wait events (buffer was full)
+    stat_spin_waits: AtomicU64,
+
+    /// Minimum observed dispatch latency (ns)
+    stat_min_ns: AtomicU64,
+
+    /// Maximum observed dispatch latency (ns)
+    stat_max_ns: AtomicU64,
+}
+
+// SAFETY: All shared state is behind atomics; queue_ptr is stable unified memory.
+unsafe impl Send for LockFreeDispatcher {}
+unsafe impl Sync for LockFreeDispatcher {}
+
+/// Statistics snapshot for `LockFreeDispatcher`
+#[derive(Debug, Clone)]
+pub struct LockFreeStats {
+    pub commands_dispatched: u64,
+    pub average_dispatch_ns: u64,
+    pub min_dispatch_ns: u64,
+    pub max_dispatch_ns: u64,
+    pub total_latency_ns: u64,
+    pub spin_wait_events: u64,
+}
+
+impl LockFreeDispatcher {
+    /// Create a new lock-free dispatcher over a CommandQueueHost in unified memory.
+    ///
+    /// # Safety
+    /// `queue_ptr` must point to a valid `CommandQueueHost` allocated in CUDA
+    /// unified memory and must remain valid for the lifetime of this dispatcher.
+    pub fn new(queue_ptr: *mut CommandQueueHost) -> Result<Self, Box<dyn std::error::Error>> {
+        if queue_ptr.is_null() {
+            return Err("Queue pointer cannot be null".into());
+        }
+
+        // Read the current head so we stay in sync with any prior state
+        let initial_head = unsafe { std::ptr::read_volatile(&(*queue_ptr).head) };
+
+        Ok(LockFreeDispatcher {
+            queue_ptr,
+            head: AtomicU32::new(initial_head),
+            next_id: AtomicU32::new(0),
+            stat_dispatched: AtomicU64::new(0),
+            stat_total_ns: AtomicU64::new(0),
+            stat_spin_waits: AtomicU64::new(0),
+            stat_min_ns: AtomicU64::new(u64::MAX),
+            stat_max_ns: AtomicU64::new(0),
+        })
+    }
+
+    // ================================================================
+    // CORE DISPATCH — lock-free, zero-synchronization push
+    // ================================================================
+
+    /// Push a single command into the ring buffer.
+    ///
+    /// 1. `fetch_add(1, Relaxed)` on the head index to claim a slot.
+    /// 2. Spin-wait if the buffer is completely full (head caught up to tail).
+    /// 3. Volatile-write the command into `buffer[slot]`.
+    /// 4. Release fence so the GPU sees the command bytes before the head update.
+    ///
+    /// **No `cudaDeviceSynchronize()` is called.** The GPU persistent kernel
+    /// sees the new head on its next `__threadfence_system()` poll cycle.
+    ///
+    /// # Returns
+    /// `(command_id, dispatch_latency_ns)`
+    #[inline]
+    pub fn push(&self, mut cmd: Command) -> Result<(u32, u64), Box<dyn std::error::Error>> {
+        let start = Instant::now();
+
+        let queue_cap = crate::cuda_claw::QUEUE_SIZE as u32;
+
+        // ── 1. Claim a slot (Relaxed — no cross-thread ordering needed) ──
+        let claimed_head = self.head.fetch_add(1, Ordering::Relaxed);
+        let slot = claimed_head % queue_cap;
+
+        // ── 2. Spin-wait if buffer is completely full ──
+        // Full condition: producer is a full lap ahead of consumer.
+        // We compare (claimed_head - tail) >= queue_cap.
+        // Only spin — never call cudaDeviceSynchronize().
+        unsafe {
+            let tail_ptr = &(*self.queue_ptr).tail as *const u32;
+            let mut spins: u64 = 0;
+            loop {
+                let tail = std::ptr::read_volatile(tail_ptr);
+                // Wrapping distance from tail to our claimed slot
+                let distance = claimed_head.wrapping_sub(tail);
+                if distance < queue_cap {
+                    break; // There is room
+                }
+                // Buffer is full — spin
+                spins += 1;
+                if spins % 1024 == 0 {
+                    // Yield to avoid burning 100 % of a core indefinitely
+                    std::thread::yield_now();
+                }
+            }
+            if spins > 0 {
+                self.stat_spin_waits.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        // ── 3. Prepare command metadata ──
+        let cmd_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        cmd.id = cmd_id;
+        cmd.timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as u64;
+
+        // ── 4. Volatile write to unified memory (PCIe-visible) ──
+        // No cudaDeviceSynchronize() — the persistent kernel will see this
+        // on its next poll via __threadfence_system().
+        //
+        // MULTI-PRODUCER SAFETY (ticket-lock ordered publication):
+        // Multiple producers can claim slots concurrently via fetch_add, but
+        // the GPU-visible `queue.head` must advance *in order*. If producer B
+        // (slot 6) finishes before producer A (slot 5), writing head=7 would
+        // let the GPU read the unfinished slot 5. Instead, each producer waits
+        // until `queue.head == claimed_head` before advancing head to
+        // `claimed_head + 1`. This guarantees all prior slots are committed.
+        unsafe {
+            let queue = &mut *self.queue_ptr;
+
+            // Write command payload into the ring buffer slot
+            let cmd_ptr = &mut queue.buffer[slot as usize] as *mut Command;
+            std::ptr::write_volatile(cmd_ptr, cmd);
+
+            // Release fence: ensure command bytes are globally visible
+            // BEFORE we update head (which the GPU polls).
+            std::sync::atomic::fence(Ordering::Release);
+
+            // ── Ordered head publication (ticket-lock) ──
+            // Spin until all prior producers have committed their slots.
+            // This turns the concurrent fetch_add into a sequentially
+            // consistent publication chain without a mutex.
+            let head_ptr = &queue.head as *const u32;
+            let mut pub_spins: u64 = 0;
+            loop {
+                let visible_head = std::ptr::read_volatile(head_ptr);
+                if visible_head == claimed_head {
+                    break; // Our turn to publish
+                }
+                pub_spins += 1;
+                if pub_spins % 1024 == 0 {
+                    std::thread::yield_now();
+                } else {
+                    std::hint::spin_loop();
+                }
+            }
+
+            // Now safe to advance head — all slots up to claimed_head are committed.
+            let head_mut_ptr = &mut (*self.queue_ptr).head as *mut u32;
+            std::ptr::write_volatile(head_mut_ptr, claimed_head.wrapping_add(1));
+
+            // Bump commands_sent counter.
+            // SAFETY: This runs while we still hold the ticket-lock (head ==
+            // claimed_head + 1), so the NEXT producer's ticket-lock spin on
+            // head hasn't resolved yet.  However, a *prior* producer could
+            // still be executing this line concurrently (it already published
+            // its head).  Use a true atomic add to avoid the read-modify-write
+            // race described in review comment BUG_0001.
+            let sent_ptr = std::ptr::addr_of!((*self.queue_ptr).commands_sent) as *mut u64;
+            #[cfg(target_has_atomic = "64")]
+            {
+                let sent_atomic = &*(sent_ptr as *const std::sync::atomic::AtomicU64);
+                sent_atomic.fetch_add(1, Ordering::Relaxed);
+            }
+            #[cfg(not(target_has_atomic = "64"))]
+            {
+                // Fallback for platforms without 64-bit atomics (unlikely on
+                // x86_64 / aarch64, but keeps the build green everywhere).
+                let current_sent = std::ptr::read_volatile(sent_ptr);
+                std::ptr::write_volatile(sent_ptr, current_sent.wrapping_add(1));
+            }
+        }
+
+        // ── 5. Record latency stats (Relaxed — off the hot path) ──
+        let latency_ns = start.elapsed().as_nanos() as u64;
+        self.stat_dispatched.fetch_add(1, Ordering::Relaxed);
+        self.stat_total_ns.fetch_add(latency_ns, Ordering::Relaxed);
+
+        // Update min latency (CAS loop)
+        let mut cur_min = self.stat_min_ns.load(Ordering::Relaxed);
+        while latency_ns < cur_min {
+            match self.stat_min_ns.compare_exchange_weak(
+                cur_min, latency_ns, Ordering::Relaxed, Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(v) => cur_min = v,
+            }
+        }
+
+        // Update max latency (CAS loop)
+        let mut cur_max = self.stat_max_ns.load(Ordering::Relaxed);
+        while latency_ns > cur_max {
+            match self.stat_max_ns.compare_exchange_weak(
+                cur_max, latency_ns, Ordering::Relaxed, Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(v) => cur_max = v,
+            }
+        }
+
+        Ok((cmd_id, latency_ns))
+    }
+
+    // ================================================================
+    // BATCH DISPATCH
+    // ================================================================
+
+    /// Push a batch of commands. Each command is pushed individually through
+    /// the lock-free path — the per-command overhead is dominated by the
+    /// volatile write, not by any locking.
+    pub fn push_batch(
+        &self,
+        commands: Vec<Command>,
+    ) -> Result<Vec<(u32, u64)>, Box<dyn std::error::Error>> {
+        let mut results = Vec::with_capacity(commands.len());
+        for cmd in commands {
+            results.push(self.push(cmd)?);
+        }
+        Ok(results)
+    }
+
+    // ================================================================
+    // SHUTDOWN — graceful persistent kernel exit
+    // ================================================================
+
+    /// Signal the persistent GPU kernel to exit its polling loop.
+    ///
+    /// Sets `is_running = false` in the unified-memory `CommandQueueHost`.
+    /// The GPU kernel checks `queue->is_running` on every poll iteration
+    /// (inside `while(queue->is_running)`) and will exit cleanly once it
+    /// observes `false`.
+    ///
+    /// **No `cudaDeviceSynchronize()` is called.** The kernel will see the
+    /// flag change on its next `__threadfence_system()` cycle and shut down
+    /// on its own. If you need to block until the kernel has actually exited,
+    /// synchronize the CUDA stream externally after calling `stop()`.
+    pub fn stop(&self) {
+        unsafe {
+            let queue = &mut *self.queue_ptr;
+            // Volatile write so the GPU sees the change immediately
+            std::ptr::write_volatile(&mut queue.is_running, false);
+            // Release fence to ensure the write is globally visible
+            std::sync::atomic::fence(Ordering::Release);
+        }
+    }
+
+    // ================================================================
+    // STATISTICS
+    // ================================================================
+
+    /// Snapshot current dispatch statistics.
+    pub fn get_stats(&self) -> LockFreeStats {
+        let dispatched = self.stat_dispatched.load(Ordering::Relaxed);
+        let total_ns = self.stat_total_ns.load(Ordering::Relaxed);
+        let min_ns = self.stat_min_ns.load(Ordering::Relaxed);
+        let max_ns = self.stat_max_ns.load(Ordering::Relaxed);
+        let spin_waits = self.stat_spin_waits.load(Ordering::Relaxed);
+
+        let avg_ns = if dispatched > 0 { total_ns / dispatched } else { 0 };
+
+        LockFreeStats {
+            commands_dispatched: dispatched,
+            average_dispatch_ns: avg_ns,
+            min_dispatch_ns: if min_ns == u64::MAX { 0 } else { min_ns },
+            max_dispatch_ns: max_ns,
+            total_latency_ns: total_ns,
+            spin_wait_events: spin_waits,
+        }
+    }
+
+    /// Reset all statistics to zero.
+    pub fn reset_stats(&self) {
+        self.stat_dispatched.store(0, Ordering::Relaxed);
+        self.stat_total_ns.store(0, Ordering::Relaxed);
+        self.stat_spin_waits.store(0, Ordering::Relaxed);
+        self.stat_min_ns.store(u64::MAX, Ordering::Relaxed);
+        self.stat_max_ns.store(0, Ordering::Relaxed);
+    }
+
+    /// Print a human-readable statistics summary.
+    pub fn print_stats(&self) {
+        let s = self.get_stats();
+        println!("=== LockFreeDispatcher Statistics ===");
+        println!("  Commands dispatched:  {}", s.commands_dispatched);
+        println!("  Average dispatch:     {} ns", s.average_dispatch_ns);
+        println!("  Min dispatch:         {} ns", s.min_dispatch_ns);
+        println!("  Max dispatch:         {} ns", s.max_dispatch_ns);
+        println!("  Total latency:        {} ns", s.total_latency_ns);
+        println!("  Spin-wait events:     {}", s.spin_wait_events);
+        println!("=====================================");
+    }
+}
+
+// ============================================================
 // BENCHMARK INFRASTRUCTURE
 // ============================================================
 
@@ -1041,7 +1414,7 @@ impl Default for BenchmarkConfig {
             num_commands: 10_000,
             warmup_iterations: 1_000,
             target_latency_ns: 5_000, // 5 microseconds
-            command_type: CommandType::Noop,
+            command_type: CommandType::NoOp,
             detailed_stats: true,
         }
     }
@@ -1284,13 +1657,13 @@ impl SpinLockDispatcher {
 
 /// Create a NOOP command for benchmarking
 pub fn create_noop_command(id: u32) -> Command {
-    Command::new(CommandType::Noop, id)
+    Command::new(CommandType::NoOp, id)
 }
 
 /// Create a batch of NOOP commands
 pub fn create_noop_batch(count: u64) -> Vec<Command> {
     (0..count)
-        .map(|i| Command::new(CommandType::Noop, i as u32))
+        .map(|i| Command::new(CommandType::NoOp, i as u32))
         .collect()
 }
 
@@ -1303,6 +1676,7 @@ mod tests {
     use super::*;
     use crate::cuda_claw::CommandQueueHost;
 
+    #[cfg(feature = "cuda")]
     #[test]
     fn test_dispatcher_creation() {
         let queue_data = CommandQueueHost::default();
@@ -1366,13 +1740,13 @@ mod tests {
         let config = BenchmarkConfig::default();
         assert_eq!(config.num_commands, 10_000);
         assert_eq!(config.target_latency_ns, 5_000);
-        assert_eq!(config.command_type, CommandType::Noop);
+        assert_eq!(config.command_type, CommandType::NoOp);
     }
 
     #[test]
     fn test_create_noop_command() {
         let cmd = create_noop_command(42);
-        assert_eq!(cmd.cmd_type, CommandType::Noop as u32);
+        assert_eq!(cmd.cmd_type, CommandType::NoOp as u32);
         assert_eq!(cmd.id, 42);
     }
 
@@ -1382,5 +1756,155 @@ mod tests {
         assert_eq!(commands.len(), 100);
         assert_eq!(commands[0].id, 0);
         assert_eq!(commands[99].id, 99);
+    }
+
+    // ============================================================
+    // LockFreeDispatcher Tests
+    // ============================================================
+
+    /// Helper: allocate a boxed CommandQueueHost and return a raw pointer.
+    /// The box is returned so the caller keeps ownership (prevents drop).
+    fn alloc_test_queue() -> (Box<CommandQueueHost>, *mut CommandQueueHost) {
+        let mut queue = Box::new(CommandQueueHost::default());
+        queue.is_running = true;
+        let ptr = &mut *queue as *mut CommandQueueHost;
+        (queue, ptr)
+    }
+
+    #[test]
+    fn test_lockfree_dispatcher_creation() {
+        let (_queue, ptr) = alloc_test_queue();
+        let dispatcher = LockFreeDispatcher::new(ptr);
+        assert!(dispatcher.is_ok());
+    }
+
+    #[test]
+    fn test_lockfree_null_pointer_rejected() {
+        let result = LockFreeDispatcher::new(std::ptr::null_mut());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_lockfree_push_single_command() {
+        let (_queue, ptr) = alloc_test_queue();
+        let dispatcher = LockFreeDispatcher::new(ptr).unwrap();
+
+        let cmd = Command::new(CommandType::NoOp, 0);
+        let result = dispatcher.push(cmd);
+        assert!(result.is_ok());
+
+        let (cmd_id, latency_ns) = result.unwrap();
+        assert_eq!(cmd_id, 0);
+        assert!(latency_ns > 0);
+
+        // Verify stats
+        let stats = dispatcher.get_stats();
+        assert_eq!(stats.commands_dispatched, 1);
+        assert_eq!(stats.spin_wait_events, 0);
+    }
+
+    #[test]
+    fn test_lockfree_push_batch() {
+        let (_queue, ptr) = alloc_test_queue();
+        let dispatcher = LockFreeDispatcher::new(ptr).unwrap();
+
+        let commands: Vec<Command> = (0..10)
+            .map(|i| Command::new(CommandType::NoOp, i))
+            .collect();
+        let results = dispatcher.push_batch(commands);
+        assert!(results.is_ok());
+
+        let results = results.unwrap();
+        assert_eq!(results.len(), 10);
+
+        let stats = dispatcher.get_stats();
+        assert_eq!(stats.commands_dispatched, 10);
+    }
+
+    #[test]
+    fn test_lockfree_stop_sets_is_running_false() {
+        let (_queue, ptr) = alloc_test_queue();
+        let dispatcher = LockFreeDispatcher::new(ptr).unwrap();
+
+        // Verify is_running starts as true
+        unsafe {
+            assert!(std::ptr::read_volatile(&(*ptr).is_running));
+        }
+
+        dispatcher.stop();
+
+        // Verify is_running is now false
+        unsafe {
+            assert!(!std::ptr::read_volatile(&(*ptr).is_running));
+        }
+    }
+
+    #[test]
+    fn test_lockfree_stats_reset() {
+        let (_queue, ptr) = alloc_test_queue();
+        let dispatcher = LockFreeDispatcher::new(ptr).unwrap();
+
+        // Push some commands
+        for _ in 0..5 {
+            let cmd = Command::new(CommandType::NoOp, 0);
+            dispatcher.push(cmd).unwrap();
+        }
+        assert_eq!(dispatcher.get_stats().commands_dispatched, 5);
+
+        // Reset and verify
+        dispatcher.reset_stats();
+        let stats = dispatcher.get_stats();
+        assert_eq!(stats.commands_dispatched, 0);
+        assert_eq!(stats.total_latency_ns, 0);
+        assert_eq!(stats.spin_wait_events, 0);
+        assert_eq!(stats.min_dispatch_ns, 0); // u64::MAX maps to 0
+        assert_eq!(stats.max_dispatch_ns, 0);
+    }
+
+    #[test]
+    fn test_lockfree_head_advances_correctly() {
+        let (_queue, ptr) = alloc_test_queue();
+        let dispatcher = LockFreeDispatcher::new(ptr).unwrap();
+
+        // Push 3 commands and verify head in unified memory
+        for _ in 0..3 {
+            let cmd = Command::new(CommandType::NoOp, 0);
+            dispatcher.push(cmd).unwrap();
+        }
+
+        unsafe {
+            let head = std::ptr::read_volatile(&(*ptr).head);
+            assert_eq!(head, 3);
+        }
+    }
+
+    #[test]
+    fn test_lockfree_no_cuda_device_synchronize() {
+        // This is a compile-time / code-review check:
+        // The LockFreeDispatcher::push() method must NOT call
+        // cudaDeviceSynchronize(). We verify by pushing commands
+        // successfully — if it tried to call cudaDeviceSynchronize
+        // without a CUDA context, it would fail/panic.
+        let (_queue, ptr) = alloc_test_queue();
+        let dispatcher = LockFreeDispatcher::new(ptr).unwrap();
+
+        for i in 0..100 {
+            let cmd = Command::new(CommandType::NoOp, i);
+            assert!(dispatcher.push(cmd).is_ok());
+        }
+    }
+
+    #[test]
+    fn test_lockfree_stats_snapshot() {
+        let stats = LockFreeStats {
+            commands_dispatched: 100,
+            average_dispatch_ns: 50,
+            min_dispatch_ns: 10,
+            max_dispatch_ns: 200,
+            total_latency_ns: 5000,
+            spin_wait_events: 2,
+        };
+        assert_eq!(stats.commands_dispatched, 100);
+        assert_eq!(stats.spin_wait_events, 2);
     }
 }

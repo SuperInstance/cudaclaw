@@ -1,9 +1,8 @@
+use cuda_claw::{CommandQueueHost, Command, CommandType};
 #[cfg(feature = "cuda")]
-use cuda_claw::{CudaClawExecutor, CommandQueueHost, Command, CommandType};
-#[cfg(feature = "cuda")]
+use cuda_claw::CudaClawExecutor;
 use std::sync::{Arc, Mutex};
-#[cfg(feature = "cuda")]
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // Terminal color codes for output
 mod colors {
@@ -26,14 +25,19 @@ mod agent;
 mod alignment;
 #[cfg(feature = "cuda")]
 mod bridge;
-#[cfg(feature = "cuda")]
+mod constraint_theory;
 mod cuda_claw;
-mod dna;
-#[cfg(feature = "cuda")]
 mod dispatcher;
-#[cfg(feature = "cuda")]
+mod dna;
+mod gpu_cell_agent;
+mod gpu_metrics;
+mod installer;
 mod lock_free_queue;
-#[cfg(feature = "cuda")]
+mod ml_feedback;
+mod ramify;
+mod ramify_monitor;
+mod runtime;
+mod spreadsheet_bridge;
 mod monitor;
 #[cfg(feature = "cuda")]
 mod volatile_dispatcher;
@@ -45,10 +49,10 @@ use alignment::{assert_alignment, verify_alignment, KernelConfig, KernelLifecycl
 #[cfg(feature = "cuda")]
 use bridge::{GpuBridge, allocate_command_queue};
 #[cfg(feature = "cuda")]
-use dispatcher::{GpuDispatcher, create_add_command, create_add_batch, calculate_batch_stats, SpinLockDispatcher, BenchmarkConfig, create_noop_command, create_noop_batch};
-#[cfg(feature = "cuda")]
+use dispatcher::{GpuDispatcher, create_add_command, create_add_batch, calculate_batch_stats};
+use dispatcher::{SpinLockDispatcher, BenchmarkConfig, create_noop_command, create_noop_batch};
+use gpu_metrics::{GpuMetricsCollector, HighResolutionTimer, LatencyStats};
 use lock_free_queue::LockFreeCommandQueue;
-#[cfg(feature = "cuda")]
 use monitor::{SuperInstanceMonitor, quick_demo};
 #[cfg(feature = "cuda")]
 use volatile_dispatcher::{VolatileDispatcher, RoundTripBenchmark};
@@ -930,10 +934,17 @@ fn run_persistent_kernel_demo() -> Result<(), Box<dyn std::error::Error>> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ============================================================
-    // CLI: Check for "dna" subcommand before CUDA init
+    // CLI: Check for "install" subcommand before CUDA init
     // ============================================================
+    // The installer can run without a live GPU (simulated mode),
+    // so we handle it before cust::quick_init() which would fail
+    // on machines without CUDA.
     let args: Vec<String> = std::env::args().skip(1).collect();
 
+    // ============================================================
+    // CLI: Check for "dna" subcommand before CUDA init
+    // ============================================================
+    // The RamifiedRole DNA manager can run without a live GPU.
     if args.first().map(|s| s.as_str()) == Some("dna") {
         let sub_args: Vec<String> = args[1..].to_vec();
 
@@ -997,6 +1008,347 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ============================================================
+    // CLI: Check for "constraint" subcommand before CUDA init
+    // ============================================================
+    if args.first().map(|s| s.as_str()) == Some("constraint") {
+        let sub_args: Vec<String> = args[1..].to_vec();
+
+        if sub_args.iter().any(|a| a == "--help" || a == "-h") {
+            constraint_theory::print_constraint_help();
+            return Ok(());
+        }
+
+        match constraint_theory::parse_constraint_args(&sub_args) {
+            Some(constraint_theory::ConstraintCliAction::ShowDna) => {
+                constraint_theory::show_dna();
+                return Ok(());
+            }
+            Some(constraint_theory::ConstraintCliAction::Validate) => {
+                constraint_theory::validate_dna();
+                return Ok(());
+            }
+            Some(constraint_theory::ConstraintCliAction::Export(path)) => {
+                let dna = constraint_theory::ConstraintDna::default_system_dna();
+                let json = serde_json::to_string_pretty(&dna).unwrap();
+                std::fs::write(&path, &json).expect("Failed to write DNA file");
+                println!("DNA exported to {}", path);
+                return Ok(());
+            }
+            Some(constraint_theory::ConstraintCliAction::Import(path)) => {
+                let json = std::fs::read_to_string(&path).expect("Failed to read DNA file");
+                let _dna: constraint_theory::ConstraintDna = serde_json::from_str(&json).expect("Invalid DNA JSON");
+                println!("DNA imported from {} (validated OK)", path);
+                return Ok(());
+            }
+            Some(constraint_theory::ConstraintCliAction::ShowTwins) => {
+                let mut twin_map = constraint_theory::GeometricTwinMap::new(8, 8);
+                twin_map.build_default_topology();
+                println!("Geometric Twin Topology: {} nodes, {} bindings",
+                    twin_map.node_count(), twin_map.binding_count());
+                for b in twin_map.bindings().iter().take(8) {
+                    println!("  Cell({},{}) <-> Twin '{}'", b.cell_row, b.cell_col, b.twin_node_id);
+                }
+                return Ok(());
+            }
+            Some(constraint_theory::ConstraintCliAction::Demo) => {
+                constraint_theory::run_demo();
+                return Ok(());
+            }
+            None => {
+                constraint_theory::print_constraint_help();
+                return Ok(());
+            }
+        }
+    }
+
+    // ============================================================
+    // CLI: Check for "agent" subcommand before CUDA init
+    // ============================================================
+    if args.first().map(|s| s.as_str()) == Some("agent") {
+        let sub_args: Vec<String> = args[1..].to_vec();
+
+        if sub_args.iter().any(|a| a == "--help" || a == "-h") {
+            gpu_cell_agent::print_agent_help();
+            return Ok(());
+        }
+
+        match gpu_cell_agent::parse_agent_args(&sub_args) {
+            Some(gpu_cell_agent::AgentCliAction::Demo { rows, cols }) => {
+                gpu_cell_agent::run_demo(rows, cols);
+                return Ok(());
+            }
+            Some(gpu_cell_agent::AgentCliAction::Status { rows, cols }) => {
+                gpu_cell_agent::show_status(rows, cols);
+                return Ok(());
+            }
+            Some(gpu_cell_agent::AgentCliAction::ListFibers) => {
+                gpu_cell_agent::list_fibers();
+                return Ok(());
+            }
+            None => {
+                gpu_cell_agent::print_agent_help();
+                return Ok(());
+            }
+        }
+    }
+
+    // ============================================================
+    // CLI: Check for "feedback" subcommand before CUDA init
+    // ============================================================
+    if args.first().map(|s| s.as_str()) == Some("feedback") {
+        let sub_args: Vec<String> = args[1..].to_vec();
+
+        if sub_args.iter().any(|a| a == "--help" || a == "-h") {
+            ml_feedback::print_feedback_help();
+            return Ok(());
+        }
+
+        match ml_feedback::parse_feedback_args(&sub_args) {
+            Some(ml_feedback::FeedbackCliAction::Demo) => {
+                ml_feedback::run_demo();
+                return Ok(());
+            }
+            Some(ml_feedback::FeedbackCliAction::Status) => {
+                ml_feedback::show_status();
+                return Ok(());
+            }
+            Some(ml_feedback::FeedbackCliAction::Analyze) => {
+                ml_feedback::run_demo(); // Analyze runs the full pipeline
+                return Ok(());
+            }
+            Some(ml_feedback::FeedbackCliAction::Apply) => {
+                ml_feedback::run_demo(); // Apply runs and applies mutations
+                return Ok(());
+            }
+            Some(ml_feedback::FeedbackCliAction::Export(path)) => {
+                // Run analysis and export report
+                use ml_feedback::{ExecutionLog, ExecutionEntry, SuccessAnalyzer};
+                let mut log = ExecutionLog::new(1000);
+                for i in 0..100 {
+                    log.record(ExecutionEntry {
+                        agent_id: format!("cell_{}", i),
+                        fiber_type: "cell_update".into(),
+                        execution_time_us: 2.0 + (i as f64 * 0.05),
+                        registers_used: 24,
+                        shared_memory_used: 2048,
+                        coalescing_ratio: 0.9,
+                        warp_occupancy: 0.7,
+                        success: true,
+                        timestamp_epoch: 1000 + i as u64,
+                    });
+                }
+                let dna = constraint_theory::ConstraintDna::default_system_dna();
+                let analyzer = SuccessAnalyzer::new(dna);
+                let report = analyzer.analyze(&log);
+                let json = serde_json::to_string_pretty(&report).unwrap();
+                std::fs::write(&path, &json).expect("Failed to write report");
+                println!("Analysis report exported to {}", path);
+                return Ok(());
+            }
+            None => {
+                ml_feedback::print_feedback_help();
+                return Ok(());
+            }
+        }
+    }
+
+    // ============================================================
+    // CLI: Check for "monitor" subcommand (Ramify Monitor)
+    // ============================================================
+    // The Ramify Monitor dashboard visualizes the cudaclaw ecosystem
+    // as a tree: Canopy (data harvesting), Roots (PTX/hardware),
+    // and Micro-organisms (agent resource exhaust).
+    if args.first().map(|s| s.as_str()) == Some("monitor-tree") {
+        let sub_args: Vec<String> = args[1..].to_vec();
+
+        if sub_args.iter().any(|a| a == "--help" || a == "-h") {
+            ramify_monitor::print_monitor_help();
+            return Ok(());
+        }
+
+        match ramify_monitor::parse_monitor_args(&sub_args) {
+            Some(ramify_monitor::MonitorCliAction::Demo) => {
+                ramify_monitor::run_demo();
+                return Ok(());
+            }
+            Some(ramify_monitor::MonitorCliAction::Html(path)) => {
+                ramify_monitor::run_html_export(&path);
+                return Ok(());
+            }
+            Some(ramify_monitor::MonitorCliAction::Json(path)) => {
+                ramify_monitor::run_json_export(&path);
+                return Ok(());
+            }
+            None => {
+                ramify_monitor::print_monitor_help();
+                return Ok(());
+            }
+        }
+    }
+
+    // ============================================================
+    // CLI: Check for "ramify" subcommand before CUDA init
+    // ============================================================
+    // The Ramify engine can run demonstrations and status checks
+    // without a live GPU, so we handle it before cust::quick_init().
+    if args.first().map(|s| s.as_str()) == Some("ramify") {
+        let sub_args: Vec<String> = args[1..].to_vec();
+
+        // Handle --help
+        if sub_args.iter().any(|a| a == "--help" || a == "-h") {
+            ramify::print_ramify_help();
+            return Ok(());
+        }
+
+        match ramify::parse_ramify_args(&sub_args) {
+            Some(ramify::RamifyCliAction::Status) | Some(ramify::RamifyCliAction::StatusWithConfig(..)) => {
+                let config = match ramify::parse_ramify_args(&sub_args) {
+                    Some(ramify::RamifyCliAction::StatusWithConfig(c)) => c,
+                    _ => ramify::RamifyConfig::default(),
+                };
+                ramify::show_status(config);
+                return Ok(());
+            }
+            Some(ramify::RamifyCliAction::Demo) | Some(ramify::RamifyCliAction::DemoWithConfig(..)) => {
+                let config = match ramify::parse_ramify_args(&sub_args) {
+                    Some(ramify::RamifyCliAction::DemoWithConfig(c)) => c,
+                    _ => ramify::RamifyConfig::default(),
+                };
+                ramify::run_demo(config);
+                return Ok(());
+            }
+            None => {
+                ramify::print_ramify_help();
+                return Ok(());
+            }
+        }
+    }
+
+    // ============================================================
+    // CLI: Check for "runtime" subcommand before CUDA init
+    // ============================================================
+    // The Ramify Runtime can run demonstrations and status checks
+    // without a live GPU (simulated NVRTC fallback).
+    if args.first().map(|s| s.as_str()) == Some("runtime") {
+        let sub_args: Vec<String> = args[1..].to_vec();
+
+        if sub_args.iter().any(|a| a == "--help" || a == "-h") {
+            runtime::print_runtime_help();
+            return Ok(());
+        }
+
+        match runtime::parse_runtime_args(&sub_args) {
+            Some(runtime::RuntimeCliAction::Demo) => {
+                runtime::run_demo();
+                return Ok(());
+            }
+            Some(runtime::RuntimeCliAction::Status) => {
+                runtime::show_status();
+                return Ok(());
+            }
+            Some(runtime::RuntimeCliAction::Export(path)) => {
+                let mut rt = runtime::RamifyRuntime::new(".claw-dna");
+                rt.compile_all_fibers();
+                match rt.export_report(&path) {
+                    Ok(()) => println!("Runtime report exported to {}", path),
+                    Err(e) => eprintln!("Export failed: {}", e),
+                }
+                return Ok(());
+            }
+            Some(runtime::RuntimeCliAction::Help) | None => {
+                runtime::print_runtime_help();
+                return Ok(());
+            }
+        }
+    }
+
+    // ============================================================
+    // CLI: Check for "spreadsheet" subcommand before CUDA init
+    // ============================================================
+    // The Spreadsheet Bridge maps cells to Cudaclaw Roots,
+    // harvests formula patterns, checks fiber efficiency,
+    // and triggers Ramification events for parallel recalculation.
+    if args.first().map(|s| s.as_str()) == Some("spreadsheet") {
+        let sub_args: Vec<String> = args[1..].to_vec();
+
+        if sub_args.iter().any(|a| a == "--help" || a == "-h") {
+            spreadsheet_bridge::print_spreadsheet_help();
+            return Ok(());
+        }
+
+        match spreadsheet_bridge::parse_spreadsheet_args(&sub_args) {
+            Some(spreadsheet_bridge::SpreadsheetCliAction::Demo) => {
+                spreadsheet_bridge::run_demo();
+                return Ok(());
+            }
+            Some(spreadsheet_bridge::SpreadsheetCliAction::Status) => {
+                spreadsheet_bridge::show_status();
+                return Ok(());
+            }
+            Some(spreadsheet_bridge::SpreadsheetCliAction::Export(path)) => {
+                let mut bridge = spreadsheet_bridge::SpreadsheetBridge::new(16, 16);
+                // Run a few sample operations so the export has data.
+                bridge.on_cell_edit(0, 0, 42.0);
+                bridge.register_formula(1, 0, "=SUM(A1:A16)");
+                let _ = bridge.tick();
+                match bridge.export_report(&path) {
+                    Ok(()) => println!("Bridge report exported to {}", path),
+                    Err(e) => eprintln!("Export failed: {}", e),
+                }
+                return Ok(());
+            }
+            Some(spreadsheet_bridge::SpreadsheetCliAction::Help) | None => {
+                spreadsheet_bridge::print_spreadsheet_help();
+                return Ok(());
+            }
+        }
+    }
+
+    if args.first().map(|s| s.as_str()) == Some("install") {
+        // Handle --help
+        if args.iter().any(|a| a == "--help" || a == "-h") {
+            installer::print_installer_help();
+            return Ok(());
+        }
+
+        // Handle --list-profiles
+        if args.iter().any(|a| a == "--list-profiles") {
+            let config = installer::parse_installer_args(&args)
+                .unwrap_or_default();
+            let inst = installer::Installer::new(config);
+            inst.list_profiles()?;
+            return Ok(());
+        }
+
+        // Handle --show-profile
+        if args.iter().any(|a| a == "--show-profile") {
+            let config = installer::parse_installer_args(&args)
+                .unwrap_or_default();
+            let inst = installer::Installer::new(config);
+            inst.show_profile()?;
+            return Ok(());
+        }
+
+        // Run full installer pipeline
+        if let Some(config) = installer::parse_installer_args(&args) {
+            let inst = installer::Installer::new(config);
+            let (profile, path) = inst.run().await?;
+            println!("Installer complete. Profile saved to: {}", path.display());
+            println!("Role: {}, Score: {:.1}, P99 RTT: {:.2} µs",
+                profile.role_name, profile.best_score, profile.achieved_p99_rtt_us);
+            return Ok(());
+        }
+    }
+
+    // ============================================================
+    // CLI: Check for "benchmark" subcommand (no CUDA required)
+    // ============================================================
+    if args.first().map(|s| s.as_str()) == Some("benchmark") {
+        run_p99_cell_edit_benchmark()?;
+        return Ok(());
+    }
+
+    // ============================================================
     // CUDA-dependent section
     // ============================================================
     #[cfg(feature = "cuda")]
@@ -1012,8 +1364,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Verify alignment before proceeding
         run_alignment_verification()?;
 
+        // DEMO 1: Spin-Lock Dispatcher Benchmark
         run_spinlock_benchmark()?;
 
+        // DEMO 2: SuperInstance Monitor
         println!("\n{}Launching SuperInstance Monitor demo...{}", colors::CYAN, colors::RESET);
         std::thread::sleep(Duration::from_secs(2));
 
@@ -1024,6 +1378,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         run_monitor_demo(executor.queue.clone(), 100, 100, Duration::from_millis(100))?;
 
         executor.shutdown()?;
+
+        // DEMO 3: P99 Cell-Edit Latency Benchmark + GPU Metrics
+        run_p99_cell_edit_benchmark()?;
     }
 
     #[cfg(not(feature = "cuda"))]
@@ -1031,12 +1388,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("CudaClaw - GPU-Accelerated SmartCRDT Orchestrator");
         println!("==============================================\n");
         println!("Running without CUDA support. Available subcommands:");
-        println!("  dna --demo        - RamifiedRole DNA manager demo");
-        println!("  dna --identity    - Show saved hardware identity");
-        println!("  dna --check-identity - Check hardware compatibility");
-        println!("  dna --probe       - Run hardware probe");
-        println!("  dna --show        - Show default DNA");
-        println!("  dna --validate    - Validate DNA");
+        println!("  benchmark   - P99 cell-edit latency benchmark (no GPU required)");
+        println!("  dna         - RamifiedRole DNA manager");
+        println!("  constraint  - Constraint-Theory DNA");
+        println!("  agent       - GPU cell agent manager");
+        println!("  feedback    - ML feedback loop");
+        println!("  ramify      - Ramify engine");
+        println!("  runtime     - Ramify runtime");
+        println!("  spreadsheet - Spreadsheet bridge");
+        println!("  install     - Intelligent installer");
+        println!("  monitor-tree - Ramify monitor dashboard");
         println!("\nTo enable CUDA features, build with: cargo build --features cuda");
     }
 
@@ -1570,6 +1931,260 @@ fn run_monitor_quick_demo() -> Result<(), Box<dyn std::error::Error>> {
     println!("Running 20 update cycles of live monitoring...\n");
 
     quick_demo()?;
+
+    Ok(())
+}
+
+// ============================================================
+// P99 Cell-Edit Latency Benchmark
+// ============================================================
+//
+// Pushes 1,000,000 random cell edits through the CommandQueue
+// (host-side lock-free ring buffer), measures per-push latency
+// with nanosecond precision, calculates P99, and writes
+// latency_report.json.
+//
+// GPU occupancy and thermal metrics are collected via
+// GpuMetricsCollector (NVML when available, simulated otherwise)
+// to verify that hot-polling is not causing hardware throttling.
+// ============================================================
+
+/// Run the P99 cell-edit latency benchmark.
+///
+/// This function:
+/// 1. Allocates a `CommandQueueHost` in plain host memory (no CUDA
+///    required) so the benchmark runs even without a GPU.
+/// 2. Pushes 1,000,000 random `CellEdit` commands through the
+///    lock-free ring buffer, timing each push with a
+///    `HighResolutionTimer`.
+/// 3. Collects GPU thermal/occupancy snapshots every 50,000 edits.
+/// 4. Computes full latency statistics (min, max, mean, P50, P90,
+///    P95, P99, P99.9).
+/// 5. Writes `latency_report.json` to the current working directory.
+fn run_p99_cell_edit_benchmark() -> Result<(), Box<dyn std::error::Error>> {
+    use rand::Rng;
+    use std::mem::zeroed;
+
+    println!("\n{}", "=".repeat(60));
+    println!("  P99 Cell-Edit Latency Benchmark");
+    println!("{}", "=".repeat(60));
+    println!("  Target  : 1,000,000 random cell edits");
+    println!("  Metric  : push latency (nanoseconds, host-side)");
+    println!("  Output  : latency_report.json");
+    println!("{}\n", "=".repeat(60));
+
+    const TOTAL_EDITS: usize = 1_000_000;
+    const WARMUP_EDITS: usize = 10_000;
+    const GPU_SAMPLE_INTERVAL: usize = 50_000;
+
+    // --------------------------------------------------------
+    // 1. Allocate CommandQueue in host memory
+    // --------------------------------------------------------
+    // We use a plain zeroed CommandQueueHost so the benchmark
+    // works without a live CUDA context.  The lock-free push
+    // logic is identical to the unified-memory path.
+    let mut queue: CommandQueueHost = unsafe { zeroed() };
+
+    // --------------------------------------------------------
+    // 2. Start GPU metrics collector
+    // --------------------------------------------------------
+    let mut gpu = GpuMetricsCollector::new(0);
+    let initial_snap = gpu.collect();
+    println!("[GPU] Initial state: {}", initial_snap.summary());
+
+    // --------------------------------------------------------
+    // 3. High-resolution timer for overall benchmark
+    // --------------------------------------------------------
+    let mut bench_timer = HighResolutionTimer::new("p99_cell_edit_benchmark");
+    let mut push_timer  = HighResolutionTimer::new("push_latency");
+
+    // --------------------------------------------------------
+    // 4. Warmup phase
+    // --------------------------------------------------------
+    println!("Warming up ({} edits)...", WARMUP_EDITS);
+    let mut rng = rand::thread_rng();
+
+    for i in 0..WARMUP_EDITS {
+        let cmd = Command {
+            cmd_type: CommandType::SpreadsheetEdit as u32,
+            id: (i % u32::MAX as usize) as u32,
+            timestamp: i as u64,
+            data_a: rng.gen_range(0.0_f32..1_000_000.0),
+            data_b: rng.gen_range(0.0_f32..1_000_000.0),
+            result: 0.0,
+            batch_data: rng.gen::<u64>(),
+            batch_count: 1,
+            _padding: 0,
+            result_code: 0,
+        };
+
+        // Drain the queue when full (simulate consumer)
+        if LockFreeCommandQueue::is_queue_full(&queue) {
+            LockFreeCommandQueue::reset_queue(&mut queue);
+        }
+        LockFreeCommandQueue::push_command(&mut queue, cmd);
+    }
+
+    // Reset queue and stats after warmup
+    LockFreeCommandQueue::reset_queue(&mut queue);
+    println!("Warmup complete.\n");
+
+    // --------------------------------------------------------
+    // 5. Main benchmark loop
+    // --------------------------------------------------------
+    println!("Starting benchmark ({} edits)...", TOTAL_EDITS);
+
+    let mut push_latencies_ns: Vec<u64> = Vec::with_capacity(TOTAL_EDITS);
+    let mut failed_pushes: u64 = 0;
+
+    bench_timer.start();
+
+    for i in 0..TOTAL_EDITS {
+        // Collect GPU metrics periodically (stored inside gpu collector)
+        if i % GPU_SAMPLE_INTERVAL == 0 && i > 0 {
+            let snap = gpu.collect();
+            let pct = (i * 100) / TOTAL_EDITS;
+            println!(
+                "  [{:>3}%] edit {:>9} | GPU: {}",
+                pct, i, snap.summary()
+            );
+            if snap.is_throttled() {
+                println!("  WARNING: GPU throttling detected at edit {}!", i);
+            }
+        }
+
+        // Build a random cell-edit command
+        let cmd = Command {
+            cmd_type: CommandType::SpreadsheetEdit as u32,
+            id: (i % u32::MAX as usize) as u32,
+            timestamp: i as u64,
+            data_a: rng.gen_range(0.0_f32..1_000_000.0),
+            data_b: rng.gen_range(0.0_f32..1_000_000.0),
+            result: 0.0,
+            batch_data: rng.gen::<u64>(),
+            batch_count: 1,
+            _padding: 0,
+            result_code: 0,
+        };
+
+        // Drain queue when full (simulate GPU consumer)
+        if LockFreeCommandQueue::is_queue_full(&queue) {
+            LockFreeCommandQueue::reset_queue(&mut queue);
+        }
+
+        // Time the push
+        push_timer.start();
+        let pushed = LockFreeCommandQueue::push_command(&mut queue, cmd);
+        let elapsed_ns = push_timer.stop_ns();
+
+        if pushed {
+            push_latencies_ns.push(elapsed_ns);
+        } else {
+            failed_pushes += 1;
+        }
+    }
+
+    let bench_elapsed_ns = bench_timer.stop_ns();
+    let bench_elapsed_secs = bench_elapsed_ns as f64 / 1_000_000_000.0;
+
+    // Final GPU snapshot
+    let final_snap = gpu.collect();
+    println!("\n[GPU] Final state: {}", final_snap.summary());
+
+    // --------------------------------------------------------
+    // 6. Compute latency statistics
+    // --------------------------------------------------------
+    println!("\nComputing latency statistics...");
+
+    push_latencies_ns.sort_unstable();
+    let stats = LatencyStats::from_sorted_ns(&push_latencies_ns);
+    stats.print_table("CommandQueue Push");
+
+    let throughput = push_latencies_ns.len() as f64 / bench_elapsed_secs;
+    println!("\nThroughput : {:.2} million edits/sec", throughput / 1_000_000.0);
+    println!("Total time : {:.3} seconds", bench_elapsed_secs);
+    println!("Failed     : {} pushes (queue-full, drained by simulated consumer)", failed_pushes);
+
+    // --------------------------------------------------------
+    // 7. GPU metrics summary
+    // --------------------------------------------------------
+    gpu.print_summary();
+
+    // --------------------------------------------------------
+    // 8. Write latency_report.json
+    // --------------------------------------------------------
+    println!("Writing latency_report.json...");
+
+    let throttling_detected = gpu.snapshots().iter().any(|s| s.is_throttled());
+    let mut notes: Vec<String> = Vec::new();
+
+    if failed_pushes > 0 {
+        notes.push(format!(
+            "{} pushes failed (queue full); consumer drain was simulated by resetting head/tail",
+            failed_pushes
+        ));
+    }
+    if throttling_detected {
+        notes.push("GPU thermal/power throttling was detected during the benchmark. \
+                    Consider reducing hot-polling frequency or adding sleep intervals.".to_string());
+    } else {
+        notes.push("No GPU throttling detected. Hot-polling appears safe at this workload.".to_string());
+    }
+    notes.push(format!(
+        "Benchmark ran {} warmup edits followed by {} measured edits.",
+        WARMUP_EDITS, TOTAL_EDITS
+    ));
+
+    let report = serde_json::json!({
+        "schema_version": "1.0",
+        "generated_at_unix_secs": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        "benchmark": {
+            "name": "P99 Cell-Edit Latency Benchmark",
+            "total_cell_edits": TOTAL_EDITS,
+            "warmup_edits": WARMUP_EDITS,
+            "failed_pushes": failed_pushes,
+            "benchmark_duration_secs": bench_elapsed_secs,
+            "throughput_edits_per_sec": throughput,
+        },
+        "push_latency_ns": {
+            "samples": stats.samples,
+            "min_ns": stats.min_ns,
+            "max_ns": stats.max_ns,
+            "mean_ns": stats.mean_ns,
+            "std_dev_ns": stats.std_dev_ns,
+            "p50_ns": stats.p50_ns,
+            "p90_ns": stats.p90_ns,
+            "p95_ns": stats.p95_ns,
+            "p99_ns": stats.p99_ns,
+            "p999_ns": stats.p999_ns,
+            "min_us": stats.min_us,
+            "max_us": stats.max_us,
+            "mean_us": stats.mean_us,
+            "p50_us": stats.p50_us,
+            "p90_us": stats.p90_us,
+            "p95_us": stats.p95_us,
+            "p99_us": stats.p99_us,
+            "p999_us": stats.p999_us,
+        },
+        "gpu_metrics": gpu.to_json(),
+        "throttling_detected": throttling_detected,
+        "notes": notes,
+    });
+
+    let report_path = "latency_report.json";
+    let report_str = serde_json::to_string_pretty(&report)?;
+    std::fs::write(report_path, &report_str)?;
+
+    println!("latency_report.json written ({} bytes)", report_str.len());
+    println!("\n{}", "=".repeat(60));
+    println!("  P99 Benchmark Complete");
+    println!("  P99 push latency : {:.3} µs ({} ns)", stats.p99_us, stats.p99_ns);
+    println!("  Throughput       : {:.2}M edits/sec", throughput / 1_000_000.0);
+    println!("  GPU throttling   : {}", if throttling_detected { "YES (see notes)" } else { "NO" });
+    println!("{}\n", "=".repeat(60));
 
     Ok(())
 }

@@ -13,8 +13,11 @@
 //
 // Verification is done via compile-time assertions (see below)
 
+#[cfg(feature = "cuda")]
 use cust::prelude::*;
+#[cfg(feature = "cuda")]
 use cust::memory::{CopyDestination, DeviceBuffer, UnifiedBuffer};
+#[cfg(feature = "cuda")]
 use std::ffi::CString;
 use std::time::{Duration, Instant};
 
@@ -25,26 +28,26 @@ pub mod ptx;
 // MEMORY ALIGNMENT VERIFICATION
 // ============================================================
 
-// Macro to get field offset for compile-time verification
+// Macro to get field offset for verification (safe for packed structs)
 macro_rules! offset_of {
     ($ty:ty, $field:ident) => {{
         let uninit = std::mem::MaybeUninit::<$ty>::uninit();
         let ptr = uninit.as_ptr();
         unsafe {
-            (&(*ptr).$field as *const _ as usize) - (ptr as usize)
+            let field_ptr = std::ptr::addr_of!((*ptr).$field);
+            (field_ptr as *const u8).offset_from(ptr as *const u8) as usize
         }
     }};
 }
 
-// Compile-time assertions for critical field offsets
+// Runtime assertions for critical field offsets
 #[test]
 fn verify_command_layout() {
-    // These tests will fail at compile time if offsets are wrong
-    const _ASSERT_CMD_TYPE: [(); offset_of!(Command, cmd_type) - 0] = [(); 0];
-    const _ASSERT_ID: [(); offset_of!(Command, id) - 4] = [(); 0];
-    const _ASSERT_TIMESTAMP: [(); offset_of!(Command, timestamp) - 8] = [(); 0];
-    const _ASSERT_DATA_A: [(); offset_of!(Command, data_a) - 16] = [(); 0];
-    const _ASSERT_RESULT_CODE: [(); offset_of!(Command, result_code) - 44] = [(); 0];
+    assert_eq!(offset_of!(Command, cmd_type), 0);
+    assert_eq!(offset_of!(Command, id), 4);
+    assert_eq!(offset_of!(Command, timestamp), 8);
+    assert_eq!(offset_of!(Command, data_a), 16);
+    assert_eq!(offset_of!(Command, result_code), 44);
 }
 
 // Status flags (must match CUDA enum)
@@ -274,9 +277,11 @@ impl Default for CommandQueueHost {
 }
 
 // Implement DeviceCopy for CommandQueueHost to enable use in UnifiedBuffer
+#[cfg(feature = "cuda")]
 unsafe impl cust::memory::DeviceCopy for CommandQueueHost {}
 
 // CudaClaw executor - manages the persistent kernel
+#[cfg(feature = "cuda")]
 pub struct CudaClawExecutor {
     module: Module,
     pub queue: UnifiedBuffer<CommandQueueHost>,  // Made public for external access
@@ -285,6 +290,7 @@ pub struct CudaClawExecutor {
     kernel_variant: KernelVariant,
 }
 
+#[cfg(feature = "cuda")]
 #[derive(Debug, Clone, Copy)]
 pub enum KernelVariant {
     Adaptive,        // Adaptive polling - balances latency and power
@@ -294,6 +300,7 @@ pub enum KernelVariant {
     MultiBlockWorker, // Multi-block persistent worker for higher throughput
 }
 
+#[cfg(feature = "cuda")]
 impl CudaClawExecutor {
     /// Initialize a new CudaClaw executor
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
@@ -491,7 +498,7 @@ impl CudaClawExecutor {
 
             if queue.status == QueueStatus::Done as u32 {
                 let idx = ((queue.tail + QUEUE_SIZE as u32 - 1) % QUEUE_SIZE as u32) as usize;
-                let cmd = queue.commands[idx];
+                let cmd = queue.buffer[idx];
 
                 // Reset status to idle
                 let mut queue_mut = self.queue.clone();
@@ -642,6 +649,7 @@ impl CudaClawExecutor {
 }
 
 /// Statistics from the executor
+#[cfg(feature = "cuda")]
 #[derive(Debug, Clone)]
 pub struct ExecutorStats {
     pub commands_processed: u64,
@@ -652,6 +660,7 @@ pub struct ExecutorStats {
 }
 
 /// Worker statistics from the persistent worker kernel
+#[cfg(feature = "cuda")]
 #[derive(Debug, Clone)]
 pub struct WorkerStats {
     pub commands_processed: u64,
@@ -667,6 +676,7 @@ pub struct WorkerStats {
 }
 
 /// Warp-level performance metrics
+#[cfg(feature = "cuda")]
 #[derive(Debug, Clone)]
 pub struct WarpMetrics {
     pub utilization_percent: u32,
@@ -675,6 +685,7 @@ pub struct WarpMetrics {
     pub consecutive_idle: u32,
 }
 
+#[cfg(feature = "cuda")]
 impl From<u32> for PollingStrategy {
     fn from(val: u32) -> Self {
         match val {
