@@ -967,6 +967,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 dna::run_check_identity();
                 return Ok(());
             }
+            Some(dna::DnaCliAction::Soil) => {
+                dna::run_soil_demo();
+                return Ok(());
+            }
             Some(dna::DnaCliAction::Export(path)) => {
                 let role = dna::RamifiedRole::default_spreadsheet_engine();
                 match role.save_to_file(&path) {
