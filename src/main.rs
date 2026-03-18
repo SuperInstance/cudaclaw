@@ -945,6 +945,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 dna::validate_dna();
                 return Ok(());
             }
+            Some(dna::DnaCliAction::Probe) => {
+                dna::run_probe();
+                return Ok(());
+            }
             Some(dna::DnaCliAction::Export(path)) => {
                 let role = dna::RamifiedRole::default_spreadsheet_engine();
                 match role.save_to_file(&path) {
