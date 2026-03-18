@@ -31,6 +31,7 @@ mod lock_free_queue;
 mod ml_feedback;
 mod ramify;
 mod ramify_monitor;
+mod runtime;
 mod monitor;
 mod volatile_dispatcher;
 
@@ -1180,6 +1181,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             None => {
                 ramify::print_ramify_help();
+                return Ok(());
+            }
+        }
+    }
+
+    // ============================================================
+    // CLI: Check for "runtime" subcommand before CUDA init
+    // ============================================================
+    // The Ramify Runtime can run demonstrations and status checks
+    // without a live GPU (simulated NVRTC fallback).
+    if args.first().map(|s| s.as_str()) == Some("runtime") {
+        let sub_args: Vec<String> = args[1..].to_vec();
+
+        if sub_args.iter().any(|a| a == "--help" || a == "-h") {
+            runtime::print_runtime_help();
+            return Ok(());
+        }
+
+        match runtime::parse_runtime_args(&sub_args) {
+            Some(runtime::RuntimeCliAction::Demo) => {
+                runtime::run_demo();
+                return Ok(());
+            }
+            Some(runtime::RuntimeCliAction::Status) => {
+                runtime::show_status();
+                return Ok(());
+            }
+            Some(runtime::RuntimeCliAction::Export(path)) => {
+                let mut rt = runtime::RamifyRuntime::new(".claw-dna");
+                rt.compile_all_fibers();
+                match rt.export_report(&path) {
+                    Ok(()) => println!("Runtime report exported to {}", path),
+                    Err(e) => eprintln!("Export failed: {}", e),
+                }
+                return Ok(());
+            }
+            Some(runtime::RuntimeCliAction::Help) | None => {
+                runtime::print_runtime_help();
                 return Ok(());
             }
         }
