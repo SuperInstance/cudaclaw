@@ -23,6 +23,7 @@ mod bridge;
 mod constraint_theory;
 mod cuda_claw;
 mod dispatcher;
+mod dna;
 mod gpu_cell_agent;
 mod gpu_metrics;
 mod installer;
@@ -916,6 +917,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // so we handle it before cust::quick_init() which would fail
     // on machines without CUDA.
     let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // ============================================================
+    // CLI: Check for "dna" subcommand before CUDA init
+    // ============================================================
+    // The RamifiedRole DNA manager can run without a live GPU.
+    if args.first().map(|s| s.as_str()) == Some("dna") {
+        let sub_args: Vec<String> = args[1..].to_vec();
+
+        if sub_args.iter().any(|a| a == "--help" || a == "-h") {
+            dna::print_dna_help();
+            return Ok(());
+        }
+
+        match dna::parse_dna_args(&sub_args) {
+            Some(dna::DnaCliAction::Demo) => {
+                dna::run_demo();
+                return Ok(());
+            }
+            Some(dna::DnaCliAction::Show) => {
+                dna::show_dna();
+                return Ok(());
+            }
+            Some(dna::DnaCliAction::Validate) => {
+                dna::validate_dna();
+                return Ok(());
+            }
+            Some(dna::DnaCliAction::Export(path)) => {
+                let role = dna::RamifiedRole::default_spreadsheet_engine();
+                match role.save_to_file(&path) {
+                    Ok(()) => println!("DNA exported to {}", path),
+                    Err(e) => eprintln!("Export failed: {}", e),
+                }
+                return Ok(());
+            }
+            Some(dna::DnaCliAction::Import(path)) => {
+                match dna::RamifiedRole::load_from_file(&path) {
+                    Ok(loaded) => {
+                        println!("DNA imported from {} (validated OK)", path);
+                        loaded.print_summary();
+                    }
+                    Err(e) => eprintln!("Import failed: {}", e),
+                }
+                return Ok(());
+            }
+            None => {
+                dna::print_dna_help();
+                return Ok(());
+            }
+        }
+    }
 
     // ============================================================
     // CLI: Check for "constraint" subcommand before CUDA init
