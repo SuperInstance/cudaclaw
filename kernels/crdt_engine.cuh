@@ -3787,52 +3787,67 @@ __device__ bool warp_aggregated_write_ptx(
         if (matches) {
             // Among matching lanes, find the highest-priority update
             // (latest timestamp, highest node_id as tiebreaker).
-            // Use warp shuffle to reduce across matching lanes.
+            //
+            // BUG_0004 fix: Use a butterfly reduction instead of picking
+            // the highest lane index from the winner_mask. Lane index has
+            // no correlation with timestamp priority. The butterfly
+            // pattern (__shfl_xor_sync with offsets 1,2,4,8,16) compares
+            // each lane's (ts, node_id, value) with its partner and keeps
+            // the higher-priority tuple. After 5 rounds every lane holds
+            // the winning values, so the leader can use them directly.
 
-            uint64_t best_ts = timestamp;
-            uint32_t best_node = node_id;
-            double best_val = new_value;
-
-            // Reduce: compare with each other matching lane
-            // Shuffle timestamp as two 32-bit halves
+            // Split 64-bit timestamp and double value into 32-bit halves
+            // for warp shuffle (which only supports 32-bit operands).
             uint32_t ts_lo = (uint32_t)(timestamp & 0xFFFFFFFF);
             uint32_t ts_hi = (uint32_t)(timestamp >> 32);
             uint32_t nid = node_id;
+            uint32_t* val_bits = reinterpret_cast<uint32_t*>(&new_value);
+            uint32_t val_lo = val_bits[0];
+            uint32_t val_hi = val_bits[1];
 
-            // Broadcast leader's values
-            uint32_t leader_ts_lo = __shfl_sync(WARP_MASK, ts_lo, leader);
-            uint32_t leader_ts_hi = __shfl_sync(WARP_MASK, ts_hi, leader);
-            uint32_t leader_nid = __shfl_sync(WARP_MASK, nid, leader);
-            uint64_t leader_ts = ((uint64_t)leader_ts_hi << 32) | leader_ts_lo;
+            // Butterfly reduction: 5 rounds (log2(32) = 5).
+            // Non-matching lanes participate in the shuffle (required by
+            // WARP_MASK) but their values are never selected because they
+            // are masked out via `matches`.
+            #pragma unroll
+            for (int offset = 1; offset < WARP_SIZE; offset <<= 1) {
+                uint32_t other_ts_lo = __shfl_xor_sync(WARP_MASK, ts_lo, offset);
+                uint32_t other_ts_hi = __shfl_xor_sync(WARP_MASK, ts_hi, offset);
+                uint32_t other_nid   = __shfl_xor_sync(WARP_MASK, nid, offset);
+                uint32_t other_val_lo = __shfl_xor_sync(WARP_MASK, val_lo, offset);
+                uint32_t other_val_hi = __shfl_xor_sync(WARP_MASK, val_hi, offset);
+                // Check if the partner lane is a matching lane
+                int partner = lane_id ^ offset;
+                bool partner_matches = (match_mask >> partner) & 1u;
 
-            // Each matching lane compares its timestamp with leader's
-            // If this lane has higher priority, broadcast to leader
-            bool i_win = compare_timestamps(timestamp, node_id, leader_ts, leader_nid);
+                if (partner_matches) {
+                    uint64_t my_ts    = ((uint64_t)ts_hi << 32) | ts_lo;
+                    uint64_t other_ts = ((uint64_t)other_ts_hi << 32) | other_ts_lo;
 
-            // Find if any non-leader lane has higher priority
-            unsigned int winner_mask = __ballot_sync(WARP_MASK, matches && i_win);
-            winner_mask &= match_mask;
-
-            // If any non-leader has higher priority, use the highest lane
-            // (simple approach: highest lane in winner_mask)
-            if (winner_mask != 0) {
-                int best_lane = 31 - __clz(winner_mask);  // highest set bit
-                // Shuffle the winner's values to the leader
-                uint32_t win_val_lo, win_val_hi;
-                uint32_t* val_bits = reinterpret_cast<uint32_t*>(&new_value);
-                win_val_lo = __shfl_sync(WARP_MASK, val_bits[0], best_lane);
-                win_val_hi = __shfl_sync(WARP_MASK, val_bits[1], best_lane);
-
-                ts_lo = __shfl_sync(WARP_MASK, ts_lo, best_lane);
-                ts_hi = __shfl_sync(WARP_MASK, ts_hi, best_lane);
-                nid = __shfl_sync(WARP_MASK, nid, best_lane);
-
-                if (lane_id == leader) {
-                    best_ts = ((uint64_t)ts_hi << 32) | ts_lo;
-                    best_node = nid;
-                    uint32_t combined[2] = {win_val_lo, win_val_hi};
-                    best_val = *reinterpret_cast<double*>(combined);
+                    // compare_timestamps returns true when the first
+                    // argument has HIGHER priority (i.e., should win).
+                    // We keep the other lane's values when THEY win.
+                    bool other_wins = compare_timestamps(other_ts, other_nid, my_ts, nid);
+                    if (other_wins) {
+                        ts_lo  = other_ts_lo;
+                        ts_hi  = other_ts_hi;
+                        nid    = other_nid;
+                        val_lo = other_val_lo;
+                        val_hi = other_val_hi;
+                    }
                 }
+            }
+
+            // After reduction every matching lane holds the same winning
+            // (ts, node_id, value) tuple. Reconstruct 64-bit values.
+            uint64_t best_ts;
+            uint32_t best_node;
+            double   best_val;
+            {
+                best_ts   = ((uint64_t)ts_hi << 32) | ts_lo;
+                best_node = nid;
+                uint32_t combined[2] = {val_lo, val_hi};
+                best_val = *reinterpret_cast<double*>(combined);
             }
 
             // Only the leader performs the actual CAS

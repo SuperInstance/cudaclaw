@@ -29,6 +29,7 @@ mod installer;
 mod lock_free_queue;
 mod ml_feedback;
 mod ramify;
+mod ramify_monitor;
 mod monitor;
 mod volatile_dispatcher;
 
@@ -1056,6 +1057,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             None => {
                 ml_feedback::print_feedback_help();
+                return Ok(());
+            }
+        }
+    }
+
+    // ============================================================
+    // CLI: Check for "monitor" subcommand (Ramify Monitor)
+    // ============================================================
+    // The Ramify Monitor dashboard visualizes the cudaclaw ecosystem
+    // as a tree: Canopy (data harvesting), Roots (PTX/hardware),
+    // and Micro-organisms (agent resource exhaust).
+    if args.first().map(|s| s.as_str()) == Some("monitor-tree") {
+        let sub_args: Vec<String> = args[1..].to_vec();
+
+        if sub_args.iter().any(|a| a == "--help" || a == "-h") {
+            ramify_monitor::print_monitor_help();
+            return Ok(());
+        }
+
+        match ramify_monitor::parse_monitor_args(&sub_args) {
+            Some(ramify_monitor::MonitorCliAction::Demo) => {
+                ramify_monitor::run_demo();
+                return Ok(());
+            }
+            Some(ramify_monitor::MonitorCliAction::Html(path)) => {
+                ramify_monitor::run_html_export(&path);
+                return Ok(());
+            }
+            Some(ramify_monitor::MonitorCliAction::Json(path)) => {
+                ramify_monitor::run_json_export(&path);
+                return Ok(());
+            }
+            None => {
+                ramify_monitor::print_monitor_help();
                 return Ok(());
             }
         }
