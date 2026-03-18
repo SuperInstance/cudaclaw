@@ -3193,7 +3193,10 @@ __device__ void load_working_set(
                 if (base + current >= AWS_MAX_CELLS) break;
 
                 uint32_t slot = atomicAdd(&loaded_counter, 1U);
-                if (base + slot >= AWS_MAX_CELLS) break;
+                if (base + slot >= AWS_MAX_CELLS) {
+                    atomicSub(&loaded_counter, 1U);  // BUG_0003 fix: reclaim phantom slot
+                    break;
+                }
                 uint32_t global_idx = dirty_row * crdt->cols + c;
                 ws->cells[base + slot] = crdt->cells[global_idx];
                 ws->cell_indices[base + slot] = global_idx;
@@ -3833,14 +3836,16 @@ __device__ bool warp_aggregated_write_ptx(
                 int src_lane = __ffs(scan_mask) - 1;  // lowest set bit
                 scan_mask &= scan_mask - 1;           // clear lowest set bit
 
-                // All lanes execute the shuffle (WARP_MASK requirement).
+                // All matching lanes execute the shuffle (match_mask).
+                // Using match_mask instead of WARP_MASK avoids UB on
+                // Volta+ where non-matching lanes skip this block.
                 // Each lane provides its own values; the result is the
-                // src_lane's values broadcast to every lane.
-                uint32_t src_ts_lo  = __shfl_sync(WARP_MASK, ts_lo, src_lane);
-                uint32_t src_ts_hi  = __shfl_sync(WARP_MASK, ts_hi, src_lane);
-                uint32_t src_nid    = __shfl_sync(WARP_MASK, nid, src_lane);
-                uint32_t src_val_lo = __shfl_sync(WARP_MASK, val_lo, src_lane);
-                uint32_t src_val_hi = __shfl_sync(WARP_MASK, val_hi, src_lane);
+                // src_lane's values broadcast to every matching lane.
+                uint32_t src_ts_lo  = __shfl_sync(match_mask, ts_lo, src_lane);
+                uint32_t src_ts_hi  = __shfl_sync(match_mask, ts_hi, src_lane);
+                uint32_t src_nid    = __shfl_sync(match_mask, nid, src_lane);
+                uint32_t src_val_lo = __shfl_sync(match_mask, val_lo, src_lane);
+                uint32_t src_val_hi = __shfl_sync(match_mask, val_hi, src_lane);
 
                 // Only the leader compares and updates the best.
                 if (lane_id == leader) {
@@ -3909,7 +3914,7 @@ __device__ bool warp_aggregated_write_ptx(
             }
 
             // Broadcast CAS result from leader to all matching lanes
-            cas_success = __shfl_sync(WARP_MASK, (int)cas_success, leader);
+            cas_success = __shfl_sync(match_mask, (int)cas_success, leader);
             if (matches) {
                 success = cas_success;
             }
