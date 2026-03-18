@@ -60,6 +60,11 @@ pub struct MuscleFiberCompilation {
 
     /// Total wall-clock time for generation + compilation (microseconds).
     pub total_time_us: u64,
+
+    /// The primary kernel entry point name in the compiled PTX.
+    /// Used to validate that the PTX contains the expected symbol
+    /// before binding it to a specific fiber task.
+    pub entry_point: String,
 }
 
 // ============================================================
@@ -136,6 +141,10 @@ impl MuscleFiberCompiler {
             target_arch: arch,
             simulated,
             total_time_us,
+            // The generated kernel always uses this entry point name.
+            // Callers must verify this matches the fiber's expected symbol
+            // before storing the PTX in DnaKernelSource::Ptx.
+            entry_point: "persistent_worker_muscle".to_string(),
         })
     }
 

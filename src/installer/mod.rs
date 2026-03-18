@@ -484,13 +484,41 @@ impl Installer {
         // existing kernel sources.
         if let Some(compilation) = nvrtc_compilation {
             if !compilation.simulated {
-                // Store compiled PTX using the Ptx variant so runtime.rs loads it
-                // directly without attempting to re-compile it via NVRTC.
-                if let Some(fiber) = dna.muscle_fibers.get_mut("cell_update") {
-                    fiber.kernel_source = crate::dna::DnaKernelSource::Ptx {
-                        ptx: compilation.compilation.ptx.clone(),
-                        target_arch: compilation.target_arch.replace("compute_", "sm_"),
-                    };
+                // Route the compiled PTX to the fiber whose kernel contract
+                // matches the entry point.  The NVRTC muscle compiler always
+                // generates `persistent_worker_muscle` — this is the
+                // persistent polling kernel, which maps to the `idle_poll`
+                // fiber (block_size=32, is_persistent=true).  Storing it in
+                // `cell_update` would replace a per-cell-update kernel with
+                // an incompatible persistent-worker entry, so we route by
+                // entry point name instead.
+                let target_fiber = match compilation.entry_point.as_str() {
+                    "persistent_worker_muscle" => Some("idle_poll"),
+                    // Future: add mappings for other compiled entry points
+                    // e.g. "cell_update_muscle" => Some("cell_update"),
+                    _ => None,
+                };
+
+                if let Some(fiber_key) = target_fiber {
+                    if let Some(fiber) = dna.muscle_fibers.get_mut(fiber_key) {
+                        fiber.kernel_source = crate::dna::DnaKernelSource::Ptx {
+                            ptx: compilation.compilation.ptx.clone(),
+                            target_arch: compilation.target_arch.replace("compute_", "sm_"),
+                        };
+                        println!(
+                            "    [DNA] Stored compiled PTX in '{}' fiber \
+                             (entry='{}', {} bytes)",
+                            fiber_key,
+                            compilation.entry_point,
+                            compilation.compilation.ptx.len()
+                        );
+                    }
+                } else {
+                    println!(
+                        "    [DNA] Skipping PTX storage: no fiber mapping for \
+                         entry point '{}'",
+                        compilation.entry_point
+                    );
                 }
             }
         }
