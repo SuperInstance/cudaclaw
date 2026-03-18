@@ -420,7 +420,39 @@ Based on the hardware characteristics and role requirements, suggest optimal val
 - enable_warp_aggregation: recommended if contention_sensitivity_ratio > 5x (currently {contention_ratio:.1}x)
 - use_soa_layout: recommended if sequential bandwidth ({seq_bw:.0} GB/s) >> random bandwidth ({rand_bw:.0} GB/s)
 - L1 cache is {l1_kb} KB per SM; shared memory can be configured up to {shared_max_kb} KB per block
-- The persistent worker uses a lock-free SPSC queue in unified memory"#,
+- The persistent worker uses a lock-free SPSC queue in unified memory
+
+## L1/L2 Cache Profile — PTX Optimization Focus
+The following cache metrics are critical for your PTX constant choices. Your suggestions
+MUST be specifically tuned to this GPU's cache hierarchy:
+
+- **L1 cache per SM**: {l1_kb} KB — this determines the maximum working set that fits
+  in L1 without spilling to L2. Set shared_memory_bytes to leave enough L1 capacity
+  for the hot polling path. On this GPU, the L1/shared memory split is configurable:
+  l1_cache_preference=1 maximizes L1, l1_cache_preference=2 maximizes shared memory.
+- **L2 cache total**: {l2_kb} KB ({l2_mb:.1} MB) — the L2 must hold the command ring
+  buffer (12 KB), the cell grid working set, and dependency graph pages. If the
+  working set exceeds L2, performance drops catastrophically due to DRAM round-trips.
+- **L1 hit latency**: {l1_hit_ns:.1} ns — baseline for coalesced SoA reads.
+  Choose loop_unroll_factor so that the unrolled loop body fits within
+  {l1_kb} KB of instruction cache.
+- **L2 hit latency**: {l2_hit_ns:.1} ns — fallback for AoS reads or L1 misses.
+  If l2_hit_ns/l1_hit_ns > 3x, strongly prefer SoA layout and L1-biased cache config.
+- **L1→L2 latency ratio**: {l1_l2_ratio:.1}x — higher ratio means L1 misses are
+  expensive. Favor smaller block_size to reduce L1 pressure per SM.
+- **Global memory latency**: {global_latency_ns:.1} ns — DRAM round-trip cost.
+  This is the penalty for L2 misses. Keep the persistent worker's hot data
+  (queue head, cell values) within L2 at all times.
+
+Your PTX constants should specifically account for:
+1. Set block_size so that block_size * per-thread-register-footprint fits within
+   the SM's register file without spilling to local memory.
+2. Set shared_memory_bytes to cache exactly the hot cells being edited, leaving
+   the remaining L1 capacity for the polling loop's instruction/data cache.
+3. Choose loop_unroll_factor based on L1 instruction cache capacity — over-unrolling
+   on a {l1_kb} KB L1 causes I-cache thrashing.
+4. Set l1_cache_preference based on whether the workload is read-heavy (prefer L1=1)
+   or write-heavy with reuse (prefer shared=2)."#,
             hardware_json = hardware_json,
             role_json = role_json,
             round = round,
@@ -434,7 +466,15 @@ Based on the hardware characteristics and role requirements, suggest optimal val
             seq_bw = hardware.memory_latency.sequential_read_bandwidth_gbps,
             rand_bw = hardware.memory_latency.random_read_bandwidth_gbps,
             l1_kb = hardware.l1_cache_size_bytes / 1024,
+            l2_kb = hardware.l2_cache_size_bytes / 1024,
+            l2_mb = hardware.l2_cache_size_bytes as f64 / (1024.0 * 1024.0),
             shared_max_kb = hardware.max_shared_memory_per_block / 1024,
+            l1_hit_ns = hardware.memory_latency.l1_hit_latency_ns,
+            l2_hit_ns = hardware.memory_latency.l2_hit_latency_ns,
+            l1_l2_ratio = if hardware.memory_latency.l1_hit_latency_ns > 0.0 {
+                hardware.memory_latency.l2_hit_latency_ns / hardware.memory_latency.l1_hit_latency_ns
+            } else { 1.0 },
+            global_latency_ns = hardware.memory_latency.global_memory_latency_ns,
         );
 
         // Add previous results if available

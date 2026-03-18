@@ -688,10 +688,22 @@ impl DnaHardwareFingerprint {
         let architecture = arch_name_from_cc(cc_major, cc_minor);
         let compute_capability = format!("{}.{}", cc_major, cc_minor);
 
-        // PCIe generation estimate from attributes (not all drivers expose this)
-        let pcie_gen = device
+        // PCIe link width from device attributes
+        let pcie_width = device
             .get_attribute(cust::device::DeviceAttribute::PciExpressActiveWidth)
             .unwrap_or(16) as u32;
+
+        // PCIe generation: infer from compute capability since cust
+        // doesn't expose a direct PCI generation attribute.
+        //   cc 7.x (Volta/Turing) = PCIe 3
+        //   cc 8.x (Ampere/Ada)   = PCIe 4
+        //   cc 9.x+ (Hopper+)     = PCIe 5
+        let pcie_gen = match cc_major {
+            7 => 3,
+            8 => 4,
+            _ if cc_major >= 9 => 5,
+            _ => 3, // conservative fallback
+        };
 
         Some(DnaHardwareFingerprint {
             gpu_name,
@@ -742,7 +754,7 @@ impl DnaHardwareFingerprint {
             },
             pcie: DnaPcieProfile {
                 pcie_gen,
-                pcie_width: 16,
+                pcie_width,
                 theoretical_bandwidth_gbps: 0.0,
                 measured_h2d_gbps: 0.0,
                 measured_d2h_gbps: 0.0,
@@ -752,6 +764,110 @@ impl DnaHardwareFingerprint {
             probe_results: None,
             is_simulated: false,
         })
+    }
+
+    /// Determine if a saved Ramified Role (DNA) is compatible with the
+    /// current hardware and can run without re-optimization.
+    ///
+    /// Compatibility rules:
+    ///   - Same compute capability major version (architecture family)
+    ///   - Same or higher SM count (the saved config can't use more SMs than available)
+    ///   - Same warp size (always 32 on NVIDIA, but guard against future changes)
+    ///   - Saved shared memory per block <= current hardware's limit
+    ///   - Saved registers per block <= current hardware's limit
+    ///   - Same or higher global memory (saved config can't exceed current VRAM)
+    ///
+    /// Minor version differences within the same major version are allowed
+    /// (e.g., sm_86 DNA on sm_89 hardware is fine — both are Ampere/Ada).
+    pub fn is_compatible(&self, other: &DnaHardwareFingerprint) -> bool {
+        // Architecture family must match (same major compute capability).
+        if self.compute_capability_major != other.compute_capability_major {
+            return false;
+        }
+
+        // Warp size must match.
+        if self.warp_size != other.warp_size {
+            return false;
+        }
+
+        // The current hardware (other) must have at least as many SMs as
+        // the saved DNA was optimized for. Running a 128-SM config on a
+        // 64-SM GPU would under-utilize or break grid launch dimensions.
+        if other.sm_count < self.sm_count {
+            return false;
+        }
+
+        // Shared memory per block on the current hardware must be >=
+        // what the saved DNA expects.
+        if other.max_shared_memory_per_block < self.max_shared_memory_per_block {
+            return false;
+        }
+
+        // Register file per block on the current hardware must be >=
+        // what the saved DNA expects.
+        if other.max_registers_per_block < self.max_registers_per_block {
+            return false;
+        }
+
+        // Current hardware must have at least as much VRAM.
+        if other.global_memory_bytes < self.global_memory_bytes {
+            return false;
+        }
+
+        true
+    }
+
+    /// Return a detailed compatibility report comparing this fingerprint
+    /// against `other` (the current hardware). Each incompatibility is
+    /// described as a human-readable string.
+    pub fn compatibility_report(&self, other: &DnaHardwareFingerprint) -> Vec<String> {
+        let mut issues = Vec::new();
+
+        if self.compute_capability_major != other.compute_capability_major {
+            issues.push(format!(
+                "Architecture mismatch: saved cc_major={} vs current cc_major={}",
+                self.compute_capability_major, other.compute_capability_major
+            ));
+        }
+        if self.warp_size != other.warp_size {
+            issues.push(format!(
+                "Warp size mismatch: saved={} vs current={}",
+                self.warp_size, other.warp_size
+            ));
+        }
+        if other.sm_count < self.sm_count {
+            issues.push(format!(
+                "Insufficient SMs: saved needs {} but current has {}",
+                self.sm_count, other.sm_count
+            ));
+        }
+        if other.max_shared_memory_per_block < self.max_shared_memory_per_block {
+            issues.push(format!(
+                "Insufficient shared memory/block: saved needs {} but current has {}",
+                self.max_shared_memory_per_block, other.max_shared_memory_per_block
+            ));
+        }
+        if other.max_registers_per_block < self.max_registers_per_block {
+            issues.push(format!(
+                "Insufficient registers/block: saved needs {} but current has {}",
+                self.max_registers_per_block, other.max_registers_per_block
+            ));
+        }
+        if other.global_memory_bytes < self.global_memory_bytes {
+            issues.push(format!(
+                "Insufficient VRAM: saved needs {} bytes but current has {}",
+                self.global_memory_bytes, other.global_memory_bytes
+            ));
+        }
+        if self.compute_capability_minor != other.compute_capability_minor {
+            issues.push(format!(
+                "Note: minor version differs (saved={}.{} vs current={}.{}) — compatible within same major",
+                self.compute_capability_major, self.compute_capability_minor,
+                other.compute_capability_major, other.compute_capability_minor
+            ));
+        }
+
+        issues
     }
 
     /// Generate a filesystem-safe short identifier.
@@ -813,6 +929,1063 @@ impl DnaHardwareFingerprint {
             println!("  Contention Ratio : {:.1}x",
                 probe.atomic_contention_probe.contention_slowdown_ratio);
         }
+    }
+}
+
+// ============================================================
+// NeedsRebranding Event
+// ============================================================
+
+/// Event emitted when the current hardware does not match the
+/// saved identity fingerprint. This signals that the system's
+/// Ramified Roles (saved DNA) may no longer be optimal and should
+/// be re-optimized via the installer's LLM + micro-simulation
+/// pipeline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NeedsRebranding {
+    /// Why the rebranding was triggered.
+    pub reason: RebrandingReason,
+
+    /// The saved (old) fingerprint from identity.json.
+    pub saved_fingerprint: DnaHardwareFingerprint,
+
+    /// The current (new) fingerprint from the detected hardware.
+    pub current_fingerprint: DnaHardwareFingerprint,
+
+    /// Detailed incompatibility descriptions.
+    pub incompatibilities: Vec<String>,
+
+    /// Timestamp when the event was detected (Unix epoch seconds).
+    pub detected_at: u64,
+}
+
+/// Why a rebranding is needed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum RebrandingReason {
+    /// GPU was upgraded to a different architecture.
+    GpuUpgraded,
+    /// GPU was downgraded (fewer resources than saved DNA expects).
+    GpuDowngraded,
+    /// Container or machine was moved to different hardware.
+    HardwareChanged,
+    /// No saved identity exists yet (first run).
+    FirstRun,
+}
+
+impl NeedsRebranding {
+    /// Print a human-readable summary of the rebranding event.
+    pub fn print_summary(&self) {
+        println!("\n{}", "!".repeat(64));
+        println!("  NEEDS REBRANDING: {:?}", self.reason);
+        println!("{}", "!".repeat(64));
+        println!("  Saved GPU   : {} (cc {}.{})",
+            self.saved_fingerprint.gpu_name,
+            self.saved_fingerprint.compute_capability_major,
+            self.saved_fingerprint.compute_capability_minor);
+        println!("  Current GPU : {} (cc {}.{})",
+            self.current_fingerprint.gpu_name,
+            self.current_fingerprint.compute_capability_major,
+            self.current_fingerprint.compute_capability_minor);
+        if !self.incompatibilities.is_empty() {
+            println!("  Issues:");
+            for issue in &self.incompatibilities {
+                println!("    - {}", issue);
+            }
+        }
+        println!("  Detected at : {}", format_epoch(self.detected_at));
+        println!("  Action      : Re-run 'cudaclaw install' to re-optimize for this hardware.");
+        println!("{}", "!".repeat(64));
+    }
+}
+
+// ============================================================
+// Identity Manager — Persistent Self-Image
+// ============================================================
+
+/// The persistent identity of a cudaclaw instance, saved to
+/// `.cudaclaw/identity.json`. This is the system's "self-image"
+/// — it knows what hardware it was last configured for and can
+/// detect when the environment has changed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CudaclawIdentity {
+    /// Schema version for forward compatibility.
+    pub schema_version: u32,
+
+    /// When this identity was first created.
+    pub created_at: u64,
+
+    /// When this identity was last updated.
+    pub last_updated: u64,
+
+    /// The hardware fingerprint at the time of last configuration.
+    pub hardware: DnaHardwareFingerprint,
+
+    /// The active role (e.g., "spreadsheet_engine").
+    pub active_role: String,
+
+    /// Path to the active `.claw-dna` file (if any).
+    pub active_dna_path: Option<String>,
+
+    /// Number of times this identity has been rebranded.
+    pub rebrand_count: u32,
+
+    /// History of rebranding events (most recent last).
+    pub rebrand_history: Vec<RebrandingRecord>,
+}
+
+/// A record of a past rebranding event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RebrandingRecord {
+    /// When the rebranding occurred.
+    pub timestamp: u64,
+    /// The reason for rebranding.
+    pub reason: RebrandingReason,
+    /// The old GPU name.
+    pub old_gpu: String,
+    /// The new GPU name.
+    pub new_gpu: String,
+}
+
+impl CudaclawIdentity {
+    /// Create a new identity from the current hardware fingerprint.
+    pub fn new(hardware: DnaHardwareFingerprint, role: &str) -> Self {
+        let now = now_epoch();
+        CudaclawIdentity {
+            schema_version: 1,
+            created_at: now,
+            last_updated: now,
+            hardware,
+            active_role: role.to_string(),
+            active_dna_path: None,
+            rebrand_count: 0,
+            rebrand_history: Vec::new(),
+        }
+    }
+
+    /// Save this identity to `.cudaclaw/identity.json`.
+    pub fn save(&self, project_root: &Path) -> Result<String, DnaError> {
+        let dir = project_root.join(".cudaclaw");
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| DnaError::Io(format!("Failed to create .cudaclaw dir: {}", e)))?;
+        let path = dir.join("identity.json");
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| DnaError::Serialization(format!("Failed to serialize identity: {}", e)))?;
+        std::fs::write(&path, json)
+            .map_err(|e| DnaError::Io(format!("Failed to write identity.json: {}", e)))?;
+        Ok(path.display().to_string())
+    }
+
+    /// Load identity from `.cudaclaw/identity.json`.
+    pub fn load(project_root: &Path) -> Result<Self, DnaError> {
+        let path = project_root.join(".cudaclaw").join("identity.json");
+        let json = std::fs::read_to_string(&path)
+            .map_err(|e| DnaError::Io(format!("Failed to read identity.json: {}", e)))?;
+        let identity: CudaclawIdentity = serde_json::from_str(&json)
+            .map_err(|e| DnaError::Serialization(format!("Failed to parse identity.json: {}", e)))?;
+        Ok(identity)
+    }
+
+    /// Check if the current hardware matches the saved identity.
+    /// Returns `None` if compatible, or `Some(NeedsRebranding)` if
+    /// the hardware has changed and re-optimization is needed.
+    pub fn check_hardware(&self, current: &DnaHardwareFingerprint) -> Option<NeedsRebranding> {
+        if self.hardware.is_compatible(current) {
+            return None;
+        }
+
+        let incompatibilities = self.hardware.compatibility_report(current);
+
+        // Determine the reason based on the nature of the change.
+        let reason = if current.compute_capability_major > self.hardware.compute_capability_major {
+            RebrandingReason::GpuUpgraded
+        } else if current.compute_capability_major < self.hardware.compute_capability_major {
+            RebrandingReason::GpuDowngraded
+        } else if current.sm_count > self.hardware.sm_count {
+            RebrandingReason::GpuUpgraded
+        } else {
+            RebrandingReason::HardwareChanged
+        };
+
+        Some(NeedsRebranding {
+            reason,
+            saved_fingerprint: self.hardware.clone(),
+            current_fingerprint: current.clone(),
+            incompatibilities,
+            detected_at: now_epoch(),
+        })
+    }
+
+    /// Update the identity after a rebranding (re-optimization).
+    pub fn rebrand(&mut self, new_hardware: DnaHardwareFingerprint, reason: RebrandingReason) {
+        let old_gpu = self.hardware.gpu_name.clone();
+        let new_gpu = new_hardware.gpu_name.clone();
+
+        self.rebrand_history.push(RebrandingRecord {
+            timestamp: now_epoch(),
+            reason,
+            old_gpu,
+            new_gpu,
+        });
+        self.rebrand_count += 1;
+        self.hardware = new_hardware;
+        self.last_updated = now_epoch();
+    }
+
+    /// Print a human-readable summary.
+    pub fn print_summary(&self) {
+        println!("\n{}", "=".repeat(64));
+        println!("  CudaClaw Identity (Self-Image)");
+        println!("{}", "=".repeat(64));
+        println!("  Schema Version : {}", self.schema_version);
+        println!("  Created        : {}", format_epoch(self.created_at));
+        println!("  Last Updated   : {}", format_epoch(self.last_updated));
+        println!("  Active Role    : {}", self.active_role);
+        if let Some(ref path) = self.active_dna_path {
+            println!("  Active DNA     : {}", path);
+        } else {
+            println!("  Active DNA     : (none)");
+        }
+        println!("  Rebrand Count  : {}", self.rebrand_count);
+        println!("\n  --- Hardware Fingerprint ---");
+        self.hardware.print_summary();
+        if !self.rebrand_history.is_empty() {
+            println!("\n  --- Rebrand History ---");
+            for (i, record) in self.rebrand_history.iter().enumerate() {
+                println!("  [{}] {} — {:?}: {} -> {}",
+                    i + 1, format_epoch(record.timestamp),
+                    record.reason, record.old_gpu, record.new_gpu);
+            }
+        }
+        println!("{}", "=".repeat(64));
+    }
+}
+
+/// Check for hardware changes at startup. Loads the saved identity
+/// (or creates one if this is the first run), compares against the
+/// current hardware fingerprint, and returns a `NeedsRebranding`
+/// event if the hardware has changed.
+///
+/// On first run, saves the identity and returns `NeedsRebranding`
+/// with `FirstRun` reason so the installer pipeline is triggered.
+pub fn check_identity_at_startup(
+    project_root: &Path,
+    current_hardware: &DnaHardwareFingerprint,
+    role: &str,
+) -> Option<NeedsRebranding> {
+    match CudaclawIdentity::load(project_root) {
+        Ok(identity) => {
+            // Existing identity — check compatibility.
+            identity.check_hardware(current_hardware)
+        }
+        Err(_) => {
+            // No identity file — first run. Save and signal.
+            let identity = CudaclawIdentity::new(current_hardware.clone(), role);
+            let _ = identity.save(project_root);
+            Some(NeedsRebranding {
+                reason: RebrandingReason::FirstRun,
+                saved_fingerprint: current_hardware.clone(),
+                current_fingerprint: current_hardware.clone(),
+                incompatibilities: Vec::new(),
+                detected_at: now_epoch(),
+            })
+        }
+    }
+}
+
+// ============================================================
+// Section 1b: ResourceSoil — GPU Nutrients for Agents
+// ============================================================
+//
+// The ResourceSoil maps the HardwareFingerprint's physical limits
+// into per-SM "nutrient" pools that agents consume. When an agent
+// launches a kernel, it draws from the register, shared-memory,
+// warp-slot, and thread pools on a specific SM. The ResourceSoil
+// tracks these pools and computes a "nutrient score" (0.0–1.0)
+// that represents how much capacity remains.
+//
+// Exhaust thresholds define the tipping points where resource
+// consumption triggers system actions:
+//   - PRUNE: reduce an agent's block size / priority
+//   - BRANCH: migrate an agent to a less-loaded SM
+//   - THROTTLE: rate-limit an agent temporarily
+//   - HARVEST: reclaim resources from idle agents
+//
+// The Constraint-Theory bridge ensures that ANY Ramified code
+// (PTX generated by the LLM or NVRTC) is validated against the
+// physical DNA limits before it can run. No kernel may exceed
+// the hardware's register file, shared memory, or thermal envelope.
+
+/// The total "nutrient pool" available on a single SM, derived
+/// directly from the `DnaHardwareFingerprint`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SmNutrientPool {
+    /// SM index this pool describes.
+    pub sm_index: u32,
+
+    /// Total 32-bit registers available on this SM.
+    pub total_registers: u32,
+    /// Registers currently consumed by active agents.
+    pub used_registers: u32,
+
+    /// Total shared memory (bytes) available on this SM.
+    pub total_shared_memory_bytes: u32,
+    /// Shared memory currently consumed.
+    pub used_shared_memory_bytes: u32,
+
+    /// Maximum resident warps on this SM.
+    pub total_warp_slots: u32,
+    /// Warp slots currently occupied.
+    pub used_warp_slots: u32,
+
+    /// Maximum resident threads on this SM.
+    pub total_threads: u32,
+    /// Threads currently active.
+    pub used_threads: u32,
+}
+
+impl SmNutrientPool {
+    /// Register utilization (0.0–1.0).
+    pub fn register_utilization(&self) -> f64 {
+        if self.total_registers == 0 { return 0.0; }
+        self.used_registers as f64 / self.total_registers as f64
+    }
+
+    /// Shared memory utilization (0.0–1.0).
+    pub fn shared_memory_utilization(&self) -> f64 {
+        if self.total_shared_memory_bytes == 0 { return 0.0; }
+        self.used_shared_memory_bytes as f64 / self.total_shared_memory_bytes as f64
+    }
+
+    /// Warp slot utilization (0.0–1.0).
+    pub fn warp_utilization(&self) -> f64 {
+        if self.total_warp_slots == 0 { return 0.0; }
+        self.used_warp_slots as f64 / self.total_warp_slots as f64
+    }
+
+    /// Thread utilization (0.0–1.0).
+    pub fn thread_utilization(&self) -> f64 {
+        if self.total_threads == 0 { return 0.0; }
+        self.used_threads as f64 / self.total_threads as f64
+    }
+
+    /// Nutrient score: 1.0 minus the maximum utilization across
+    /// all resource dimensions. A score of 0.0 means at least one
+    /// resource is fully exhausted.
+    pub fn nutrient_score(&self) -> f64 {
+        let max_util = self.register_utilization()
+            .max(self.shared_memory_utilization())
+            .max(self.warp_utilization())
+            .max(self.thread_utilization());
+        (1.0 - max_util).max(0.0)
+    }
+
+    /// Returns the name of the most-stressed resource dimension.
+    pub fn bottleneck(&self) -> &'static str {
+        let ru = self.register_utilization();
+        let su = self.shared_memory_utilization();
+        let wu = self.warp_utilization();
+        let tu = self.thread_utilization();
+        let max = ru.max(su).max(wu).max(tu);
+        if (max - ru).abs() < f64::EPSILON { "registers" }
+        else if (max - su).abs() < f64::EPSILON { "shared_memory" }
+        else if (max - wu).abs() < f64::EPSILON { "warp_slots" }
+        else { "threads" }
+    }
+}
+
+/// The full ResourceSoil for the entire GPU — a collection of per-SM
+/// nutrient pools plus GPU-wide thermal state and exhaust policy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourceSoil {
+    /// Hardware fingerprint this soil was derived from.
+    pub source_gpu: String,
+
+    /// Per-SM nutrient pools (one per SM on the GPU).
+    pub sm_pools: Vec<SmNutrientPool>,
+
+    /// Current GPU temperature (Celsius). Updated via NVML polling.
+    pub current_temperature_c: f64,
+
+    /// Current GPU power draw (watts).
+    pub current_power_watts: f64,
+
+    /// Current fan speed (0–100%).
+    pub current_fan_speed_pct: f64,
+
+    /// Whether the GPU is currently thermal-throttling.
+    pub is_thermal_throttling: bool,
+
+    /// Exhaust thresholds that trigger pruning/branching/throttling.
+    pub exhaust_policy: ExhaustPolicy,
+
+    /// Timestamp of last soil update (Unix epoch seconds).
+    pub last_updated: u64,
+}
+
+/// Exhaust thresholds: the exact tipping points where resource
+/// pressure or thermal state triggers corrective actions.
+///
+/// These are derived from the hardware DNA limits and the
+/// Constraint-Theory safe bounds. Any Ramified code that would
+/// push utilization past these thresholds is blocked or pruned.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExhaustPolicy {
+    // ── Register pressure ──
+
+    /// Register utilization above this triggers a Prune event (0.0–1.0).
+    /// Default: 0.85 (85% of per-SM register file consumed).
+    pub register_prune_threshold: f64,
+
+    /// Register utilization above this blocks new kernel launches (0.0–1.0).
+    /// Default: 0.95 — hard ceiling, no kernel may push past this.
+    pub register_hard_ceiling: f64,
+
+    // ── Shared memory pressure ──
+
+    /// Shared memory utilization above this triggers Prune (0.0–1.0).
+    pub shmem_prune_threshold: f64,
+
+    /// Shared memory hard ceiling (0.0–1.0).
+    pub shmem_hard_ceiling: f64,
+
+    // ── Warp pressure ──
+
+    /// Warp occupancy above this triggers Branch (migrate to another SM).
+    pub warp_branch_threshold: f64,
+
+    // ── Thermal pressure (via NVML) ──
+
+    /// GPU temperature (°C) above which agents are throttled.
+    /// Default: 80°C — conservative to prevent GPU boost clock drops.
+    pub thermal_throttle_celsius: f64,
+
+    /// GPU temperature (°C) above which ALL non-critical agents are
+    /// pruned. This is the "emergency brake".
+    /// Default: 90°C.
+    pub thermal_emergency_celsius: f64,
+
+    /// Power draw (watts) above which throttling kicks in.
+    /// Default: derived from GPU TDP * 0.90.
+    pub power_throttle_watts: f64,
+
+    // ── Latency pressure ──
+
+    /// P99 latency (µs) above which the system prunes the offending fiber.
+    pub latency_prune_us: f64,
+
+    // ── Nutrient floor ──
+
+    /// Per-SM nutrient score below which corrective action is required.
+    /// Default: 0.15 (only 15% headroom remaining).
+    pub nutrient_critical_floor: f64,
+
+    // ── Cooldowns ──
+
+    /// Minimum milliseconds between successive prune actions on the same agent.
+    pub prune_cooldown_ms: u64,
+
+    /// Minimum milliseconds an agent must run before it can be branched.
+    pub branch_hysteresis_ms: u64,
+
+    /// Seconds an agent must be idle before its resources are harvested.
+    pub idle_harvest_seconds: f64,
+}
+
+impl ExhaustPolicy {
+    /// Derive an ExhaustPolicy from the hardware fingerprint and
+    /// constraint mappings. This maps the physical DNA limits into
+    /// operational thresholds.
+    pub fn from_hardware_and_constraints(
+        hw: &DnaHardwareFingerprint,
+        constraints: &DnaConstraintMappings,
+    ) -> Self {
+        // Register threshold: constraint's register_budget / registers_per_sm
+        let register_prune = if hw.registers_per_sm > 0 {
+            let budget = constraints.resource_bounds
+                .get("resource.register_budget")
+                .and_then(|b| match &b.value {
+                    DnaBoundValue::IntMax(v) => Some(*v as f64),
+                    _ => None,
+                })
+                .unwrap_or(32768.0);
+            (budget / hw.registers_per_sm as f64).min(0.85)
+        } else {
+            0.85
+        };
+
+        // Shared memory threshold: constraint's ceiling / max_shmem_per_sm
+        let shmem_prune = if hw.max_shared_memory_per_sm > 0 {
+            let ceiling = constraints.resource_bounds
+                .get("resource.shared_memory_ceiling")
+                .and_then(|b| match &b.value {
+                    DnaBoundValue::IntMax(v) => Some(*v as f64),
+                    _ => None,
+                })
+                .unwrap_or(49152.0);
+            (ceiling / hw.max_shared_memory_per_sm as f64).min(0.90)
+        } else {
+            0.90
+        };
+
+        // Warp branch: constraint's warp_slot_limit / max_warps_per_sm
+        let warp_branch = if hw.max_warps_per_sm > 0 {
+            let limit = constraints.resource_bounds
+                .get("resource.warp_slot_limit")
+                .and_then(|b| match &b.value {
+                    DnaBoundValue::IntMax(v) => Some(*v as f64),
+                    _ => None,
+                })
+                .unwrap_or(32.0);
+            (limit / hw.max_warps_per_sm as f64).min(0.90)
+        } else {
+            0.90
+        };
+
+        // Latency from constraint
+        let latency_prune = constraints.resource_bounds
+            .get("latency.p99_rtt_ceiling")
+            .and_then(|b| match &b.value {
+                DnaBoundValue::FloatMax(v) => Some(*v),
+                _ => None,
+            })
+            .unwrap_or(8.0);
+
+        // Nutrient floor from biological constraint
+        let nutrient_floor = constraints.resource_bounds
+            .get("biological.nutrient_floor")
+            .and_then(|b| match &b.value {
+                DnaBoundValue::FloatMin(v) => Some(*v),
+                _ => None,
+            })
+            .unwrap_or(0.15);
+
+        // Prune cooldown from constraint
+        let prune_cooldown = constraints.resource_bounds
+            .get("biological.prune_cooldown_ms")
+            .and_then(|b| match &b.value {
+                DnaBoundValue::FloatMin(v) => Some(*v as u64),
+                _ => None,
+            })
+            .unwrap_or(100);
+
+        // Branch hysteresis from constraint
+        let branch_hysteresis = constraints.resource_bounds
+            .get("biological.branch_hysteresis_ms")
+            .and_then(|b| match &b.value {
+                DnaBoundValue::FloatMin(v) => Some(*v as u64),
+                _ => None,
+            })
+            .unwrap_or(500);
+
+        // Power limit: estimate TDP from core clock and SM count
+        // (rough heuristic; real value comes from NVML at runtime)
+        let estimated_tdp = (hw.sm_count as f64 * 2.5).max(150.0).min(600.0);
+
+        ExhaustPolicy {
+            register_prune_threshold: register_prune,
+            register_hard_ceiling: 0.95,
+            shmem_prune_threshold: shmem_prune,
+            shmem_hard_ceiling: 0.98,
+            warp_branch_threshold: warp_branch,
+            thermal_throttle_celsius: 80.0,
+            thermal_emergency_celsius: 90.0,
+            power_throttle_watts: estimated_tdp * 0.90,
+            latency_prune_us: latency_prune,
+            nutrient_critical_floor: nutrient_floor,
+            prune_cooldown_ms: prune_cooldown,
+            branch_hysteresis_ms: branch_hysteresis,
+            idle_harvest_seconds: 5.0,
+        }
+    }
+}
+
+impl Default for ExhaustPolicy {
+    fn default() -> Self {
+        ExhaustPolicy {
+            register_prune_threshold: 0.85,
+            register_hard_ceiling: 0.95,
+            shmem_prune_threshold: 0.90,
+            shmem_hard_ceiling: 0.98,
+            warp_branch_threshold: 0.90,
+            thermal_throttle_celsius: 80.0,
+            thermal_emergency_celsius: 90.0,
+            power_throttle_watts: 288.0, // 320W TDP * 0.90
+            latency_prune_us: 8.0,
+            nutrient_critical_floor: 0.15,
+            prune_cooldown_ms: 100,
+            branch_hysteresis_ms: 500,
+            idle_harvest_seconds: 5.0,
+        }
+    }
+}
+
+/// Pruning event emitted when an SM's resources are exhausted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PruningEvent {
+    /// Which SM triggered the event.
+    pub sm_index: u32,
+
+    /// Which resource dimension caused the exhaust.
+    pub trigger: ExhaustTrigger,
+
+    /// The utilization value that crossed the threshold.
+    pub utilization: f64,
+
+    /// The threshold that was exceeded.
+    pub threshold: f64,
+
+    /// Recommended corrective action.
+    pub action: PruningAction,
+
+    /// Timestamp (Unix epoch seconds).
+    pub timestamp: u64,
+}
+
+/// What resource dimension triggered the exhaust.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum ExhaustTrigger {
+    /// Register file pressure.
+    RegisterPressure,
+    /// Shared memory pressure.
+    SharedMemoryPressure,
+    /// Warp slot saturation.
+    WarpSaturation,
+    /// GPU temperature exceeded threshold.
+    ThermalThrottle,
+    /// GPU temperature exceeded emergency limit.
+    ThermalEmergency,
+    /// Power draw exceeded threshold.
+    PowerThrottle,
+    /// P99 latency exceeded threshold.
+    LatencyExceeded,
+    /// SM nutrient score dropped below floor.
+    NutrientDepleted,
+}
+
+/// Corrective action recommended by the exhaust analysis.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum PruningAction {
+    /// Halve the agent's block size and reduce priority.
+    PruneAgent { agent_id: String },
+    /// Migrate the agent to a different SM.
+    BranchAgent { agent_id: String, target_sm: u32 },
+    /// Rate-limit the agent temporarily.
+    ThrottleAgent { agent_id: String, factor: f64, duration_ms: u64 },
+    /// Reclaim resources from an idle agent.
+    HarvestAgent { agent_id: String },
+    /// Throttle ALL agents on this SM (thermal emergency).
+    ThrottleAllOnSm,
+    /// Block new kernel launches until resources free up.
+    BlockLaunches,
+}
+
+impl ResourceSoil {
+    /// Create a ResourceSoil from a HardwareFingerprint. Each SM
+    /// starts with zero utilization (all nutrients available).
+    pub fn from_fingerprint(hw: &DnaHardwareFingerprint) -> Self {
+        let mut pools = Vec::with_capacity(hw.sm_count as usize);
+        for sm_idx in 0..hw.sm_count {
+            pools.push(SmNutrientPool {
+                sm_index: sm_idx,
+                total_registers: hw.registers_per_sm,
+                used_registers: 0,
+                total_shared_memory_bytes: hw.max_shared_memory_per_sm,
+                used_shared_memory_bytes: 0,
+                total_warp_slots: hw.max_warps_per_sm,
+                used_warp_slots: 0,
+                total_threads: hw.max_threads_per_sm,
+                used_threads: 0,
+            });
+        }
+
+        ResourceSoil {
+            source_gpu: hw.gpu_name.clone(),
+            sm_pools: pools,
+            current_temperature_c: 30.0, // idle default
+            current_power_watts: 15.0,   // idle default
+            current_fan_speed_pct: 25.0,
+            is_thermal_throttling: false,
+            exhaust_policy: ExhaustPolicy::default(),
+            last_updated: now_epoch(),
+        }
+    }
+
+    /// Create a ResourceSoil with exhaust policy derived from
+    /// hardware fingerprint AND Constraint-Theory mappings.
+    pub fn from_fingerprint_and_constraints(
+        hw: &DnaHardwareFingerprint,
+        constraints: &DnaConstraintMappings,
+    ) -> Self {
+        let mut soil = Self::from_fingerprint(hw);
+        soil.exhaust_policy = ExhaustPolicy::from_hardware_and_constraints(hw, constraints);
+        soil
+    }
+
+    /// Update thermal state (typically from NVML polling).
+    pub fn update_thermal(&mut self, temperature_c: f64, power_watts: f64, fan_pct: f64) {
+        self.current_temperature_c = temperature_c;
+        self.current_power_watts = power_watts;
+        self.current_fan_speed_pct = fan_pct;
+        self.is_thermal_throttling = temperature_c >= self.exhaust_policy.thermal_throttle_celsius;
+        self.last_updated = now_epoch();
+    }
+
+    /// Record resource consumption on a specific SM for an agent's
+    /// kernel launch. Returns an error if the launch would exceed
+    /// the hard ceiling.
+    pub fn consume(
+        &mut self,
+        sm_index: u32,
+        registers: u32,
+        shared_memory_bytes: u32,
+        warp_slots: u32,
+        threads: u32,
+    ) -> Result<(), String> {
+        let pool = self.sm_pools.get_mut(sm_index as usize)
+            .ok_or_else(|| format!("SM index {} out of range", sm_index))?;
+
+        // Check register hard ceiling
+        let new_reg_util = (pool.used_registers + registers) as f64 / pool.total_registers.max(1) as f64;
+        if new_reg_util > self.exhaust_policy.register_hard_ceiling {
+            return Err(format!(
+                "Register hard ceiling exceeded on SM {}: {:.1}% > {:.1}%",
+                sm_index, new_reg_util * 100.0, self.exhaust_policy.register_hard_ceiling * 100.0
+            ));
+        }
+
+        // Check shmem hard ceiling
+        let new_shmem_util = (pool.used_shared_memory_bytes + shared_memory_bytes) as f64
+            / pool.total_shared_memory_bytes.max(1) as f64;
+        if new_shmem_util > self.exhaust_policy.shmem_hard_ceiling {
+            return Err(format!(
+                "Shared memory hard ceiling exceeded on SM {}: {:.1}% > {:.1}%",
+                sm_index, new_shmem_util * 100.0, self.exhaust_policy.shmem_hard_ceiling * 100.0
+            ));
+        }
+
+        pool.used_registers += registers;
+        pool.used_shared_memory_bytes += shared_memory_bytes;
+        pool.used_warp_slots += warp_slots;
+        pool.used_threads += threads;
+        self.last_updated = now_epoch();
+        Ok(())
+    }
+
+    /// Release resources on an SM (agent finished or was pruned).
+    pub fn release(
+        &mut self,
+        sm_index: u32,
+        registers: u32,
+        shared_memory_bytes: u32,
+        warp_slots: u32,
+        threads: u32,
+    ) {
+        if let Some(pool) = self.sm_pools.get_mut(sm_index as usize) {
+            pool.used_registers = pool.used_registers.saturating_sub(registers);
+            pool.used_shared_memory_bytes = pool.used_shared_memory_bytes.saturating_sub(shared_memory_bytes);
+            pool.used_warp_slots = pool.used_warp_slots.saturating_sub(warp_slots);
+            pool.used_threads = pool.used_threads.saturating_sub(threads);
+            self.last_updated = now_epoch();
+        }
+    }
+
+    /// Scan all SMs and return pruning events for any that exceed
+    /// exhaust thresholds. Also checks thermal and power state.
+    pub fn evaluate_exhaust(&self) -> Vec<PruningEvent> {
+        let mut events = Vec::new();
+        let now = now_epoch();
+
+        // Thermal checks (GPU-wide)
+        if self.current_temperature_c >= self.exhaust_policy.thermal_emergency_celsius {
+            events.push(PruningEvent {
+                sm_index: 0,
+                trigger: ExhaustTrigger::ThermalEmergency,
+                utilization: self.current_temperature_c,
+                threshold: self.exhaust_policy.thermal_emergency_celsius,
+                action: PruningAction::ThrottleAllOnSm,
+                timestamp: now,
+            });
+        } else if self.current_temperature_c >= self.exhaust_policy.thermal_throttle_celsius {
+            events.push(PruningEvent {
+                sm_index: 0,
+                trigger: ExhaustTrigger::ThermalThrottle,
+                utilization: self.current_temperature_c,
+                threshold: self.exhaust_policy.thermal_throttle_celsius,
+                action: PruningAction::BlockLaunches,
+                timestamp: now,
+            });
+        }
+
+        // Power check
+        if self.current_power_watts > self.exhaust_policy.power_throttle_watts {
+            events.push(PruningEvent {
+                sm_index: 0,
+                trigger: ExhaustTrigger::PowerThrottle,
+                utilization: self.current_power_watts,
+                threshold: self.exhaust_policy.power_throttle_watts,
+                action: PruningAction::BlockLaunches,
+                timestamp: now,
+            });
+        }
+
+        // Per-SM checks
+        for pool in &self.sm_pools {
+            // Register pressure
+            let reg_util = pool.register_utilization();
+            if reg_util > self.exhaust_policy.register_prune_threshold {
+                events.push(PruningEvent {
+                    sm_index: pool.sm_index,
+                    trigger: ExhaustTrigger::RegisterPressure,
+                    utilization: reg_util,
+                    threshold: self.exhaust_policy.register_prune_threshold,
+                    action: PruningAction::PruneAgent {
+                        agent_id: format!("sm{}_top_consumer", pool.sm_index),
+                    },
+                    timestamp: now,
+                });
+            }
+
+            // Shared memory pressure
+            let shmem_util = pool.shared_memory_utilization();
+            if shmem_util > self.exhaust_policy.shmem_prune_threshold {
+                events.push(PruningEvent {
+                    sm_index: pool.sm_index,
+                    trigger: ExhaustTrigger::SharedMemoryPressure,
+                    utilization: shmem_util,
+                    threshold: self.exhaust_policy.shmem_prune_threshold,
+                    action: PruningAction::PruneAgent {
+                        agent_id: format!("sm{}_shmem_hog", pool.sm_index),
+                    },
+                    timestamp: now,
+                });
+            }
+
+            // Warp saturation → branch to another SM
+            let warp_util = pool.warp_utilization();
+            if warp_util > self.exhaust_policy.warp_branch_threshold {
+                // Find the least-loaded SM for migration
+                let target_sm = self.least_loaded_sm_excluding(pool.sm_index);
+                events.push(PruningEvent {
+                    sm_index: pool.sm_index,
+                    trigger: ExhaustTrigger::WarpSaturation,
+                    utilization: warp_util,
+                    threshold: self.exhaust_policy.warp_branch_threshold,
+                    action: PruningAction::BranchAgent {
+                        agent_id: format!("sm{}_warp_heavy", pool.sm_index),
+                        target_sm,
+                    },
+                    timestamp: now,
+                });
+            }
+
+            // Nutrient depletion
+            let nutrient = pool.nutrient_score();
+            if nutrient < self.exhaust_policy.nutrient_critical_floor {
+                events.push(PruningEvent {
+                    sm_index: pool.sm_index,
+                    trigger: ExhaustTrigger::NutrientDepleted,
+                    utilization: nutrient,
+                    threshold: self.exhaust_policy.nutrient_critical_floor,
+                    action: PruningAction::PruneAgent {
+                        agent_id: format!("sm{}_nutrient_crisis", pool.sm_index),
+                    },
+                    timestamp: now,
+                });
+            }
+        }
+
+        events
+    }
+
+    /// Find the SM with the highest nutrient score (most headroom),
+    /// excluding a given SM index.
+    fn least_loaded_sm_excluding(&self, exclude: u32) -> u32 {
+        self.sm_pools.iter()
+            .filter(|p| p.sm_index != exclude)
+            .max_by(|a, b| a.nutrient_score().partial_cmp(&b.nutrient_score()).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|p| p.sm_index)
+            .unwrap_or(0)
+    }
+
+    /// Validate a proposed muscle fiber launch against the physical
+    /// DNA limits. Returns a list of constraint violations.
+    /// This is the Constraint-Theory bridge: no Ramified code may
+    /// exceed the hardware's physical limits.
+    pub fn validate_fiber_launch(
+        &self,
+        sm_index: u32,
+        fiber: &DnaMuscleFiber,
+        constraints: &DnaConstraintMappings,
+    ) -> Vec<String> {
+        let mut violations = Vec::new();
+
+        let pool = match self.sm_pools.get(sm_index as usize) {
+            Some(p) => p,
+            None => {
+                violations.push(format!("SM {} does not exist (GPU has {} SMs)",
+                    sm_index, self.sm_pools.len()));
+                return violations;
+            }
+        };
+
+        // Check register budget against constraint
+        let total_regs_needed = fiber.registers_per_thread * fiber.block_size;
+        if let Some(bound) = constraints.resource_bounds.get("resource.register_budget") {
+            if let DnaBoundValue::IntMax(max) = &bound.value {
+                if total_regs_needed as u64 > *max {
+                    violations.push(format!(
+                        "Fiber '{}' needs {} registers ({}×{}) but constraint budget is {}",
+                        fiber.name, total_regs_needed,
+                        fiber.registers_per_thread, fiber.block_size, max
+                    ));
+                }
+            }
+        }
+
+        // Check against physical register file
+        let remaining_regs = pool.total_registers.saturating_sub(pool.used_registers);
+        if total_regs_needed > remaining_regs {
+            violations.push(format!(
+                "SM {} has {} registers remaining but fiber '{}' needs {}",
+                sm_index, remaining_regs, fiber.name, total_regs_needed
+            ));
+        }
+
+        // Check shared memory against constraint
+        if let Some(bound) = constraints.resource_bounds.get("resource.shared_memory_ceiling") {
+            if let DnaBoundValue::IntMax(max) = &bound.value {
+                if fiber.shared_memory_bytes as u64 > *max {
+                    violations.push(format!(
+                        "Fiber '{}' needs {} bytes shmem but constraint ceiling is {}",
+                        fiber.name, fiber.shared_memory_bytes, max
+                    ));
+                }
+            }
+        }
+
+        // Check against physical shared memory
+        let remaining_shmem = pool.total_shared_memory_bytes
+            .saturating_sub(pool.used_shared_memory_bytes);
+        if fiber.shared_memory_bytes > remaining_shmem {
+            violations.push(format!(
+                "SM {} has {} bytes shmem remaining but fiber '{}' needs {}",
+                sm_index, remaining_shmem, fiber.name, fiber.shared_memory_bytes
+            ));
+        }
+
+        // Check warp slots
+        let warps_needed = (fiber.block_size + 31) / 32; // round up
+        if let Some(bound) = constraints.resource_bounds.get("resource.warp_slot_limit") {
+            if let DnaBoundValue::IntMax(max) = &bound.value {
+                if warps_needed as u64 > *max {
+                    violations.push(format!(
+                        "Fiber '{}' needs {} warp slots but constraint limit is {}",
+                        fiber.name, warps_needed, max
+                    ));
+                }
+            }
+        }
+
+        let remaining_warps = pool.total_warp_slots.saturating_sub(pool.used_warp_slots);
+        if warps_needed > remaining_warps {
+            violations.push(format!(
+                "SM {} has {} warp slots remaining but fiber '{}' needs {}",
+                sm_index, remaining_warps, fiber.name, warps_needed
+            ));
+        }
+
+        // Check thread budget
+        if let Some(bound) = constraints.resource_bounds.get("resource.thread_budget") {
+            if let DnaBoundValue::IntMax(max) = &bound.value {
+                if fiber.block_size as u64 > *max {
+                    violations.push(format!(
+                        "Fiber '{}' launches {} threads but constraint budget is {}",
+                        fiber.name, fiber.block_size, max
+                    ));
+                }
+            }
+        }
+
+        // Thermal check
+        if self.current_temperature_c >= self.exhaust_policy.thermal_emergency_celsius {
+            violations.push(format!(
+                "GPU temperature {:.1}°C exceeds emergency limit {:.1}°C — launch blocked",
+                self.current_temperature_c, self.exhaust_policy.thermal_emergency_celsius
+            ));
+        }
+
+        violations
+    }
+
+    /// Average nutrient score across all SMs.
+    pub fn average_nutrient_score(&self) -> f64 {
+        if self.sm_pools.is_empty() { return 1.0; }
+        let total: f64 = self.sm_pools.iter().map(|p| p.nutrient_score()).sum();
+        total / self.sm_pools.len() as f64
+    }
+
+    /// Number of SMs below the critical nutrient floor.
+    pub fn critical_sm_count(&self) -> usize {
+        self.sm_pools.iter()
+            .filter(|p| p.nutrient_score() < self.exhaust_policy.nutrient_critical_floor)
+            .count()
+    }
+
+    /// Print a summary of the resource soil state.
+    pub fn print_summary(&self) {
+        println!("\n{}", "=".repeat(64));
+        println!("  ResourceSoil — GPU Nutrient Status");
+        println!("{}", "=".repeat(64));
+        println!("  Source GPU       : {}", self.source_gpu);
+        println!("  SMs              : {}", self.sm_pools.len());
+        println!("  Avg Nutrient     : {:.2}", self.average_nutrient_score());
+        println!("  Critical SMs     : {}", self.critical_sm_count());
+        println!("  Temperature      : {:.1}°C", self.current_temperature_c);
+        println!("  Power            : {:.1}W", self.current_power_watts);
+        println!("  Fan Speed        : {:.0}%", self.current_fan_speed_pct);
+        println!("  Throttling       : {}", self.is_thermal_throttling);
+
+        println!("\n  --- Exhaust Policy ---");
+        println!("    Register prune  : {:.0}%", self.exhaust_policy.register_prune_threshold * 100.0);
+        println!("    Register ceiling: {:.0}%", self.exhaust_policy.register_hard_ceiling * 100.0);
+        println!("    Shmem prune     : {:.0}%", self.exhaust_policy.shmem_prune_threshold * 100.0);
+        println!("    Shmem ceiling   : {:.0}%", self.exhaust_policy.shmem_hard_ceiling * 100.0);
+        println!("    Warp branch     : {:.0}%", self.exhaust_policy.warp_branch_threshold * 100.0);
+        println!("    Thermal throttle: {:.0}°C", self.exhaust_policy.thermal_throttle_celsius);
+        println!("    Thermal emerg.  : {:.0}°C", self.exhaust_policy.thermal_emergency_celsius);
+        println!("    Power throttle  : {:.0}W", self.exhaust_policy.power_throttle_watts);
+        println!("    Latency prune   : {:.1}µs", self.exhaust_policy.latency_prune_us);
+        println!("    Nutrient floor  : {:.0}%", self.exhaust_policy.nutrient_critical_floor * 100.0);
+
+        // Show first 5 SMs and last SM
+        let show_count = 5.min(self.sm_pools.len());
+        println!("\n  --- SM Nutrient Pools (showing {}/{}) ---", show_count, self.sm_pools.len());
+        for pool in self.sm_pools.iter().take(show_count) {
+            println!("    SM {:>3}: regs={:.0}% shmem={:.0}% warps={:.0}% threads={:.0}% | nutrient={:.2} [{}]",
+                pool.sm_index,
+                pool.register_utilization() * 100.0,
+                pool.shared_memory_utilization() * 100.0,
+                pool.warp_utilization() * 100.0,
+                pool.thread_utilization() * 100.0,
+                pool.nutrient_score(),
+                pool.bottleneck(),
+            );
+        }
+        if self.sm_pools.len() > show_count {
+            println!("    ... ({} more SMs) ...", self.sm_pools.len() - show_count);
+            if let Some(last) = self.sm_pools.last() {
+                println!("    SM {:>3}: regs={:.0}% shmem={:.0}% warps={:.0}% threads={:.0}% | nutrient={:.2} [{}]",
+                    last.sm_index,
+                    last.register_utilization() * 100.0,
+                    last.shared_memory_utilization() * 100.0,
+                    last.warp_utilization() * 100.0,
+                    last.thread_utilization() * 100.0,
+                    last.nutrient_score(),
+                    last.bottleneck(),
+                );
+            }
+        }
+        println!("{}\n", "=".repeat(64));
     }
 }
 
@@ -2390,6 +3563,9 @@ pub enum DnaCliAction {
     Probe,
     Export(String),
     Import(String),
+    Identity,
+    CheckIdentity,
+    Soil,
 }
 
 /// Parse CLI arguments for the `dna` subcommand.
@@ -2410,6 +3586,9 @@ pub fn parse_dna_args(args: &[String]) -> Option<DnaCliAction> {
             let path = args.get(1)?;
             Some(DnaCliAction::Import(path.clone()))
         }
+        "--identity" => Some(DnaCliAction::Identity),
+        "--check-identity" => Some(DnaCliAction::CheckIdentity),
+        "--soil" => Some(DnaCliAction::Soil),
         _ => None,
     }
 }
@@ -2428,6 +3607,9 @@ pub fn print_dna_help() {
     println!("  --probe      Run hardware micro-benchmarks (3x 100ms probes)");
     println!("  --export F   Export default DNA to file F (.claw-dna)");
     println!("  --import F   Import and validate a .claw-dna file");
+    println!("  --identity   Show the saved hardware identity (.cudaclaw/identity.json)");
+    println!("  --check-identity  Check if current hardware matches saved identity");
+    println!("  --soil       Show ResourceSoil (GPU nutrient pools & exhaust policy)");
     println!("  --help       Show this help");
 }
 
@@ -2549,6 +3731,42 @@ pub fn run_demo() {
     // Clean up
     let _ = std::fs::remove_file(tmp_path);
 
+    // 7.5. Identity & Compatibility
+    println!("\n--- Phase 7.5: Hardware Identity & Compatibility ---");
+    let identity_dir = std::env::temp_dir().join("cudaclaw_demo_identity");
+    let _ = std::fs::create_dir_all(&identity_dir);
+    let identity = CudaclawIdentity::new(dna.hardware.clone(), &dna.role);
+    match identity.save(&identity_dir) {
+        Ok(path) => println!("  Identity saved to: {}", path),
+        Err(e) => println!("  Identity save failed: {}", e),
+    }
+
+    // Test compatibility: same hardware should be compatible
+    let same_hw = DnaHardwareFingerprint::rtx4090_simulated();
+    let is_compat = dna.hardware.is_compatible(&same_hw);
+    println!("  Same hardware compatible: {}", is_compat);
+
+    // Test incompatibility: different architecture
+    let mut different_hw = DnaHardwareFingerprint::rtx4090_simulated();
+    different_hw.gpu_name = "NVIDIA RTX 3090 (Simulated)".into();
+    different_hw.compute_capability_major = 8;
+    different_hw.compute_capability_minor = 6;
+    different_hw.architecture = "Ampere".into();
+    different_hw.sm_count = 82;
+    let report = dna.hardware.compatibility_report(&different_hw);
+    println!("  Different GPU issues: {}", report.len());
+    for issue in &report {
+        println!("    - {}", issue);
+    }
+
+    // Test NeedsRebranding detection
+    if let Some(event) = identity.check_hardware(&different_hw) {
+        println!("  NeedsRebranding: {:?}", event.reason);
+    }
+
+    // Clean up identity demo
+    let _ = std::fs::remove_dir_all(&identity_dir);
+
     // 8. Hardware Probe
     println!("\n--- Phase 8: Dynamic Hardware Probe ---");
     let probed = probe_hardware(0);
@@ -2584,6 +3802,158 @@ pub fn run_probe() {
             }
         }
     }
+}
+
+/// Show the saved identity from `.cudaclaw/identity.json`.
+pub fn show_identity() {
+    let project_root = Path::new(".");
+    match CudaclawIdentity::load(project_root) {
+        Ok(identity) => identity.print_summary(),
+        Err(_) => {
+            println!("No identity file found at .cudaclaw/identity.json");
+            println!("Run 'cudaclaw dna --demo' or 'cudaclaw install' to create one.");
+        }
+    }
+}
+
+/// Check if the current hardware matches the saved identity.
+/// If not, emit a NeedsRebranding event.
+pub fn run_check_identity() {
+    let project_root = Path::new(".");
+    let current_hw = probe_hardware(0);
+
+    match CudaclawIdentity::load(project_root) {
+        Ok(identity) => {
+            println!("\n  Saved identity loaded from .cudaclaw/identity.json");
+            println!("  Saved GPU    : {} (cc {}.{})",
+                identity.hardware.gpu_name,
+                identity.hardware.compute_capability_major,
+                identity.hardware.compute_capability_minor);
+            println!("  Current GPU  : {} (cc {}.{})",
+                current_hw.gpu_name,
+                current_hw.compute_capability_major,
+                current_hw.compute_capability_minor);
+
+            match identity.check_hardware(&current_hw) {
+                None => {
+                    println!("\n  Result: COMPATIBLE — no rebranding needed.");
+                }
+                Some(event) => {
+                    event.print_summary();
+                }
+            }
+        }
+        Err(_) => {
+            println!("\n  No saved identity found. Creating one from current hardware...");
+            let identity = CudaclawIdentity::new(current_hw.clone(), "spreadsheet_engine");
+            match identity.save(project_root) {
+                Ok(path) => println!("  Identity saved to: {}", path),
+                Err(e) => println!("  Failed to save identity: {}", e),
+            }
+            println!("  Status: First run — consider running 'cudaclaw install' to optimize.");
+        }
+    }
+}
+
+/// Run the ResourceSoil demo — shows nutrient pools, exhaust
+/// thresholds, simulates resource consumption, and evaluates pruning.
+pub fn run_soil_demo() {
+    println!("\n{}", "=".repeat(64));
+    println!("  CudaClaw ResourceSoil Demo");
+    println!("{}", "=".repeat(64));
+
+    // 1. Build soil from hardware + constraints
+    let hw = probe_hardware(0);
+    let constraints = DnaConstraintMappings::default_system();
+    let mut soil = ResourceSoil::from_fingerprint_and_constraints(&hw, &constraints);
+
+    println!("\n--- Phase 1: Fresh ResourceSoil ---");
+    soil.print_summary();
+
+    // 2. Simulate agent consumption on a few SMs
+    println!("--- Phase 2: Simulate Agent Resource Consumption ---");
+    let sm_count = soil.sm_pools.len().min(4);
+    for i in 0..sm_count {
+        let regs = (i as u32 + 1) * 8000;
+        let shmem = (i as u32 + 1) * 4096;
+        let warps = (i as u32 + 1) * 4;
+        let threads = warps * 32;
+        match soil.consume(i as u32, regs, shmem, warps, threads) {
+            Ok(()) => println!("  SM {}: consumed {} regs, {} shmem, {} warps, {} threads",
+                i, regs, shmem, warps, threads),
+            Err(e) => println!("  SM {}: BLOCKED — {}", i, e),
+        }
+    }
+
+    // Overload SM 0 to trigger pruning
+    if !soil.sm_pools.is_empty() {
+        let heavy_regs = (soil.sm_pools[0].total_registers as f64 * 0.80) as u32;
+        match soil.consume(0, heavy_regs, 0, 0, 0) {
+            Ok(()) => println!("  SM 0: heavy load — {} more registers consumed", heavy_regs),
+            Err(e) => println!("  SM 0: BLOCKED — {}", e),
+        }
+    }
+
+    // 3. Evaluate exhaust
+    println!("\n--- Phase 3: Evaluate Exhaust Thresholds ---");
+    let events = soil.evaluate_exhaust();
+    if events.is_empty() {
+        println!("  No pruning events triggered.");
+    } else {
+        println!("  {} pruning event(s) triggered:", events.len());
+        for event in &events {
+            println!("    SM {:>3} | {:?} | util={:.2} > threshold={:.2} | action={:?}",
+                event.sm_index, event.trigger,
+                event.utilization, event.threshold,
+                event.action);
+        }
+    }
+
+    // 4. Simulate thermal pressure
+    println!("\n--- Phase 4: Simulate Thermal Pressure (via NVML) ---");
+    soil.update_thermal(82.0, 290.0, 75.0);
+    println!("  Updated: temp=82°C, power=290W, fan=75%");
+    println!("  Throttling: {}", soil.is_thermal_throttling);
+
+    let thermal_events = soil.evaluate_exhaust();
+    let thermal_only: Vec<_> = thermal_events.iter()
+        .filter(|e| matches!(e.trigger, ExhaustTrigger::ThermalThrottle | ExhaustTrigger::ThermalEmergency))
+        .collect();
+    if thermal_only.is_empty() {
+        println!("  No thermal pruning triggered.");
+    } else {
+        for event in &thermal_only {
+            println!("  THERMAL: {:?} at {:.1}°C (threshold: {:.1}°C)",
+                event.trigger, event.utilization, event.threshold);
+        }
+    }
+
+    // 5. Validate a fiber launch
+    println!("\n--- Phase 5: Validate Fiber Launch Against DNA Limits ---");
+    let fibers = DnaMuscleFiberMap::default_fibers();
+    if let Some(fiber) = fibers.get("cell_update") {
+        let violations = soil.validate_fiber_launch(0, fiber, &constraints);
+        if violations.is_empty() {
+            println!("  Fiber 'cell_update' on SM 0: APPROVED — within DNA limits.");
+        } else {
+            println!("  Fiber 'cell_update' on SM 0: BLOCKED — {} violation(s):", violations.len());
+            for v in &violations {
+                println!("    - {}", v);
+            }
+        }
+    }
+
+    // 6. Release resources
+    println!("\n--- Phase 6: Release Resources (Agent Pruned) ---");
+    soil.release(0, 8000, 4096, 4, 128);
+    println!("  SM 0: released 8000 regs, 4096 shmem, 4 warps, 128 threads");
+    println!("  SM 0 nutrient score: {:.2}", soil.sm_pools[0].nutrient_score());
+    println!("  Average nutrient: {:.2}", soil.average_nutrient_score());
+    println!("  Critical SMs: {}", soil.critical_sm_count());
+
+    println!("\n{}", "=".repeat(64));
+    println!("  ResourceSoil Demo Complete");
+    println!("{}\n", "=".repeat(64));
 }
 
 /// Validate the default DNA.
@@ -3144,6 +4514,624 @@ mod tests {
         match parse_dna_args(&args) {
             Some(DnaCliAction::Probe) => {} // expected
             other => panic!("Expected Probe, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_identity() {
+        let args = vec!["--identity".to_string()];
+        match parse_dna_args(&args) {
+            Some(DnaCliAction::Identity) => {}
+            other => panic!("Expected Identity, got {:?}", other),
+        }
+        let args2 = vec!["--check-identity".to_string()];
+        match parse_dna_args(&args2) {
+            Some(DnaCliAction::CheckIdentity) => {}
+            other => panic!("Expected CheckIdentity, got {:?}", other),
+        }
+    }
+
+    // ---- is_compatible tests ----
+
+    #[test]
+    fn test_is_compatible_same_hardware() {
+        let hw = DnaHardwareFingerprint::rtx4090_simulated();
+        assert!(hw.is_compatible(&hw));
+    }
+
+    #[test]
+    fn test_is_compatible_different_major_cc() {
+        let hw_saved = DnaHardwareFingerprint::rtx4090_simulated(); // cc 8.9
+        let mut hw_current = DnaHardwareFingerprint::rtx4090_simulated();
+        hw_current.compute_capability_major = 9; // Hopper
+        assert!(!hw_saved.is_compatible(&hw_current));
+    }
+
+    #[test]
+    fn test_is_compatible_same_major_different_minor() {
+        let hw_saved = DnaHardwareFingerprint::rtx4090_simulated(); // cc 8.9
+        let mut hw_current = DnaHardwareFingerprint::rtx4090_simulated();
+        hw_current.compute_capability_minor = 6; // sm_86 (Ampere)
+        // Same major (8), should be compatible
+        assert!(hw_saved.is_compatible(&hw_current));
+    }
+
+    #[test]
+    fn test_is_compatible_fewer_sms() {
+        let hw_saved = DnaHardwareFingerprint::rtx4090_simulated(); // 128 SMs
+        let mut hw_current = DnaHardwareFingerprint::rtx4090_simulated();
+        hw_current.sm_count = 64; // downgraded
+        assert!(!hw_saved.is_compatible(&hw_current));
+    }
+
+    #[test]
+    fn test_is_compatible_more_sms() {
+        let hw_saved = DnaHardwareFingerprint::rtx4090_simulated(); // 128 SMs
+        let mut hw_current = DnaHardwareFingerprint::rtx4090_simulated();
+        hw_current.sm_count = 256; // upgraded
+        assert!(hw_saved.is_compatible(&hw_current));
+    }
+
+    #[test]
+    fn test_is_compatible_less_shmem() {
+        let hw_saved = DnaHardwareFingerprint::rtx4090_simulated();
+        let mut hw_current = DnaHardwareFingerprint::rtx4090_simulated();
+        hw_current.max_shared_memory_per_block = hw_saved.max_shared_memory_per_block / 2;
+        assert!(!hw_saved.is_compatible(&hw_current));
+    }
+
+    #[test]
+    fn test_is_compatible_less_registers() {
+        let hw_saved = DnaHardwareFingerprint::rtx4090_simulated();
+        let mut hw_current = DnaHardwareFingerprint::rtx4090_simulated();
+        hw_current.max_registers_per_block = hw_saved.max_registers_per_block / 2;
+        assert!(!hw_saved.is_compatible(&hw_current));
+    }
+
+    #[test]
+    fn test_is_compatible_less_vram() {
+        let hw_saved = DnaHardwareFingerprint::rtx4090_simulated();
+        let mut hw_current = DnaHardwareFingerprint::rtx4090_simulated();
+        hw_current.global_memory_bytes = hw_saved.global_memory_bytes / 2;
+        assert!(!hw_saved.is_compatible(&hw_current));
+    }
+
+    #[test]
+    fn test_is_compatible_different_warp_size() {
+        let hw_saved = DnaHardwareFingerprint::rtx4090_simulated();
+        let mut hw_current = DnaHardwareFingerprint::rtx4090_simulated();
+        hw_current.warp_size = 64;
+        assert!(!hw_saved.is_compatible(&hw_current));
+    }
+
+    // ---- compatibility_report tests ----
+
+    #[test]
+    fn test_compatibility_report_empty_for_same_hw() {
+        let hw = DnaHardwareFingerprint::rtx4090_simulated();
+        let report = hw.compatibility_report(&hw);
+        // No issues (only a note about minor version being same, which is not an issue)
+        assert!(report.is_empty());
+    }
+
+    #[test]
+    fn test_compatibility_report_arch_mismatch() {
+        let hw_saved = DnaHardwareFingerprint::rtx4090_simulated();
+        let mut hw_current = DnaHardwareFingerprint::rtx4090_simulated();
+        hw_current.compute_capability_major = 9;
+        let report = hw_saved.compatibility_report(&hw_current);
+        assert!(report.iter().any(|r| r.contains("Architecture mismatch")));
+    }
+
+    #[test]
+    fn test_compatibility_report_sm_and_vram() {
+        let hw_saved = DnaHardwareFingerprint::rtx4090_simulated();
+        let mut hw_current = DnaHardwareFingerprint::rtx4090_simulated();
+        hw_current.sm_count = 64;
+        hw_current.global_memory_bytes = 1024;
+        let report = hw_saved.compatibility_report(&hw_current);
+        assert!(report.iter().any(|r| r.contains("Insufficient SMs")));
+        assert!(report.iter().any(|r| r.contains("Insufficient VRAM")));
+    }
+
+    // ---- NeedsRebranding tests ----
+
+    #[test]
+    fn test_needs_rebranding_on_arch_change() {
+        let saved_hw = DnaHardwareFingerprint::rtx4090_simulated(); // cc 8.9
+        let identity = CudaclawIdentity::new(saved_hw, "spreadsheet_engine");
+
+        let mut current_hw = DnaHardwareFingerprint::rtx4090_simulated();
+        current_hw.compute_capability_major = 9; // Hopper
+        current_hw.gpu_name = "NVIDIA H100".into();
+
+        let event = identity.check_hardware(&current_hw);
+        assert!(event.is_some());
+        let event = event.unwrap();
+        assert_eq!(event.reason, RebrandingReason::GpuUpgraded);
+        assert!(!event.incompatibilities.is_empty());
+    }
+
+    #[test]
+    fn test_no_rebranding_for_compatible_hw() {
+        let saved_hw = DnaHardwareFingerprint::rtx4090_simulated();
+        let identity = CudaclawIdentity::new(saved_hw, "spreadsheet_engine");
+
+        let current_hw = DnaHardwareFingerprint::rtx4090_simulated();
+        let event = identity.check_hardware(&current_hw);
+        assert!(event.is_none());
+    }
+
+    #[test]
+    fn test_needs_rebranding_downgrade() {
+        let saved_hw = DnaHardwareFingerprint::rtx4090_simulated(); // cc 8.9
+        let identity = CudaclawIdentity::new(saved_hw, "spreadsheet_engine");
+
+        let mut current_hw = DnaHardwareFingerprint::rtx4090_simulated();
+        current_hw.compute_capability_major = 7; // Volta
+        current_hw.gpu_name = "NVIDIA V100".into();
+
+        let event = identity.check_hardware(&current_hw);
+        assert!(event.is_some());
+        assert_eq!(event.unwrap().reason, RebrandingReason::GpuDowngraded);
+    }
+
+    #[test]
+    fn test_needs_rebranding_hardware_changed() {
+        let saved_hw = DnaHardwareFingerprint::rtx4090_simulated(); // 128 SMs
+        let identity = CudaclawIdentity::new(saved_hw, "spreadsheet_engine");
+
+        let mut current_hw = DnaHardwareFingerprint::rtx4090_simulated();
+        current_hw.sm_count = 64; // same major, fewer SMs
+        current_hw.gpu_name = "NVIDIA RTX 4070".into();
+
+        let event = identity.check_hardware(&current_hw);
+        assert!(event.is_some());
+        assert_eq!(event.unwrap().reason, RebrandingReason::HardwareChanged);
+    }
+
+    // ---- CudaclawIdentity persistence tests ----
+
+    #[test]
+    fn test_identity_save_and_load() {
+        let tmp_dir = std::env::temp_dir().join("cudaclaw_test_identity_save_load");
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        let hw = DnaHardwareFingerprint::rtx4090_simulated();
+        let identity = CudaclawIdentity::new(hw.clone(), "test_role");
+        identity.save(&tmp_dir).unwrap();
+
+        let loaded = CudaclawIdentity::load(&tmp_dir).unwrap();
+        assert_eq!(loaded.active_role, "test_role");
+        assert_eq!(loaded.hardware.gpu_name, hw.gpu_name);
+        assert_eq!(loaded.hardware.sm_count, hw.sm_count);
+        assert_eq!(loaded.rebrand_count, 0);
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_identity_rebrand() {
+        let hw = DnaHardwareFingerprint::rtx4090_simulated();
+        let mut identity = CudaclawIdentity::new(hw, "spreadsheet_engine");
+
+        let mut new_hw = DnaHardwareFingerprint::rtx4090_simulated();
+        new_hw.gpu_name = "NVIDIA H100".into();
+        new_hw.compute_capability_major = 9;
+
+        identity.rebrand(new_hw.clone(), RebrandingReason::GpuUpgraded);
+
+        assert_eq!(identity.rebrand_count, 1);
+        assert_eq!(identity.hardware.gpu_name, "NVIDIA H100");
+        assert_eq!(identity.rebrand_history.len(), 1);
+        assert_eq!(identity.rebrand_history[0].new_gpu, "NVIDIA H100");
+    }
+
+    #[test]
+    fn test_identity_serialization_roundtrip() {
+        let hw = DnaHardwareFingerprint::rtx4090_simulated();
+        let mut identity = CudaclawIdentity::new(hw, "spreadsheet_engine");
+        identity.active_dna_path = Some(".cudaclaw/dna/spreadsheet_engine.claw-dna".into());
+
+        let json = serde_json::to_string_pretty(&identity).unwrap();
+        let loaded: CudaclawIdentity = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(loaded.active_role, identity.active_role);
+        assert_eq!(loaded.active_dna_path, identity.active_dna_path);
+        assert_eq!(loaded.hardware.compute_capability, identity.hardware.compute_capability);
+    }
+
+    #[test]
+    fn test_check_identity_at_startup_first_run() {
+        let tmp_dir = std::env::temp_dir().join("cudaclaw_test_first_run");
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        let hw = DnaHardwareFingerprint::rtx4090_simulated();
+        let event = check_identity_at_startup(&tmp_dir, &hw, "spreadsheet_engine");
+
+        assert!(event.is_some());
+        assert_eq!(event.unwrap().reason, RebrandingReason::FirstRun);
+
+        // Identity file should now exist
+        let identity = CudaclawIdentity::load(&tmp_dir).unwrap();
+        assert_eq!(identity.active_role, "spreadsheet_engine");
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_check_identity_at_startup_compatible() {
+        let tmp_dir = std::env::temp_dir().join("cudaclaw_test_compat");
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        let hw = DnaHardwareFingerprint::rtx4090_simulated();
+        let identity = CudaclawIdentity::new(hw.clone(), "spreadsheet_engine");
+        identity.save(&tmp_dir).unwrap();
+
+        // Same hardware — should be compatible
+        let event = check_identity_at_startup(&tmp_dir, &hw, "spreadsheet_engine");
+        assert!(event.is_none());
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_check_identity_at_startup_incompatible() {
+        let tmp_dir = std::env::temp_dir().join("cudaclaw_test_incompat");
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        let hw = DnaHardwareFingerprint::rtx4090_simulated();
+        let identity = CudaclawIdentity::new(hw, "spreadsheet_engine");
+        identity.save(&tmp_dir).unwrap();
+
+        // Different hardware — should trigger rebranding
+        let mut new_hw = DnaHardwareFingerprint::rtx4090_simulated();
+        new_hw.compute_capability_major = 9;
+        let event = check_identity_at_startup(&tmp_dir, &new_hw, "spreadsheet_engine");
+        assert!(event.is_some());
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    // ---- ResourceSoil tests ----
+
+    #[test]
+    fn test_resource_soil_from_fingerprint() {
+        let hw = DnaHardwareFingerprint::rtx4090_simulated();
+        let soil = ResourceSoil::from_fingerprint(&hw);
+        assert_eq!(soil.sm_pools.len(), hw.sm_count as usize);
+        assert_eq!(soil.source_gpu, hw.gpu_name);
+        // All pools start empty
+        for pool in &soil.sm_pools {
+            assert_eq!(pool.used_registers, 0);
+            assert_eq!(pool.used_shared_memory_bytes, 0);
+            assert_eq!(pool.used_warp_slots, 0);
+            assert_eq!(pool.used_threads, 0);
+            assert!((pool.nutrient_score() - 1.0).abs() < f64::EPSILON);
+        }
+        assert!((soil.average_nutrient_score() - 1.0).abs() < f64::EPSILON);
+        assert_eq!(soil.critical_sm_count(), 0);
+    }
+
+    #[test]
+    fn test_resource_soil_from_fingerprint_and_constraints() {
+        let hw = DnaHardwareFingerprint::rtx4090_simulated();
+        let constraints = DnaConstraintMappings::default_system();
+        let soil = ResourceSoil::from_fingerprint_and_constraints(&hw, &constraints);
+        // Exhaust policy should reflect constraint values
+        assert!(soil.exhaust_policy.latency_prune_us > 0.0);
+        assert!(soil.exhaust_policy.nutrient_critical_floor > 0.0);
+        assert!(soil.exhaust_policy.register_prune_threshold > 0.0);
+        assert!(soil.exhaust_policy.register_prune_threshold <= 0.85);
+    }
+
+    #[test]
+    fn test_sm_nutrient_pool_utilization() {
+        let pool = SmNutrientPool {
+            sm_index: 0,
+            total_registers: 65536,
+            used_registers: 32768,
+            total_shared_memory_bytes: 102400,
+            used_shared_memory_bytes: 51200,
+            total_warp_slots: 64,
+            used_warp_slots: 32,
+            total_threads: 2048,
+            used_threads: 1024,
+        };
+        assert!((pool.register_utilization() - 0.5).abs() < 0.01);
+        assert!((pool.shared_memory_utilization() - 0.5).abs() < 0.01);
+        assert!((pool.warp_utilization() - 0.5).abs() < 0.01);
+        assert!((pool.thread_utilization() - 0.5).abs() < 0.01);
+        assert!((pool.nutrient_score() - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_sm_nutrient_pool_bottleneck() {
+        let pool = SmNutrientPool {
+            sm_index: 0,
+            total_registers: 65536,
+            used_registers: 60000, // 91% — highest
+            total_shared_memory_bytes: 102400,
+            used_shared_memory_bytes: 51200, // 50%
+            total_warp_slots: 64,
+            used_warp_slots: 32, // 50%
+            total_threads: 2048,
+            used_threads: 1024, // 50%
+        };
+        assert_eq!(pool.bottleneck(), "registers");
+    }
+
+    #[test]
+    fn test_sm_nutrient_pool_zero_total() {
+        let pool = SmNutrientPool {
+            sm_index: 0,
+            total_registers: 0,
+            used_registers: 0,
+            total_shared_memory_bytes: 0,
+            used_shared_memory_bytes: 0,
+            total_warp_slots: 0,
+            used_warp_slots: 0,
+            total_threads: 0,
+            used_threads: 0,
+        };
+        assert!((pool.register_utilization() - 0.0).abs() < f64::EPSILON);
+        assert!((pool.nutrient_score() - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_resource_soil_consume_and_release() {
+        let hw = DnaHardwareFingerprint::rtx4090_simulated();
+        let mut soil = ResourceSoil::from_fingerprint(&hw);
+        // Consume resources on SM 0
+        soil.consume(0, 1000, 2048, 2, 64).unwrap();
+        assert_eq!(soil.sm_pools[0].used_registers, 1000);
+        assert_eq!(soil.sm_pools[0].used_shared_memory_bytes, 2048);
+        assert_eq!(soil.sm_pools[0].used_warp_slots, 2);
+        assert_eq!(soil.sm_pools[0].used_threads, 64);
+        assert!(soil.sm_pools[0].nutrient_score() < 1.0);
+
+        // Release resources
+        soil.release(0, 1000, 2048, 2, 64);
+        assert_eq!(soil.sm_pools[0].used_registers, 0);
+        assert!((soil.sm_pools[0].nutrient_score() - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_resource_soil_consume_hard_ceiling() {
+        let hw = DnaHardwareFingerprint::rtx4090_simulated();
+        let mut soil = ResourceSoil::from_fingerprint(&hw);
+        // Try to consume more than the hard ceiling
+        let total_regs = soil.sm_pools[0].total_registers;
+        let result = soil.consume(0, total_regs, 0, 0, 0);
+        // total_regs / total_regs = 1.0, which exceeds 0.95 ceiling
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Register hard ceiling"));
+    }
+
+    #[test]
+    fn test_resource_soil_consume_invalid_sm() {
+        let hw = DnaHardwareFingerprint::rtx4090_simulated();
+        let mut soil = ResourceSoil::from_fingerprint(&hw);
+        let result = soil.consume(999, 100, 100, 1, 32);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("out of range"));
+    }
+
+    #[test]
+    fn test_resource_soil_release_saturating() {
+        let hw = DnaHardwareFingerprint::rtx4090_simulated();
+        let mut soil = ResourceSoil::from_fingerprint(&hw);
+        // Release more than consumed (should not underflow)
+        soil.release(0, 10000, 10000, 100, 10000);
+        assert_eq!(soil.sm_pools[0].used_registers, 0);
+        assert_eq!(soil.sm_pools[0].used_shared_memory_bytes, 0);
+    }
+
+    #[test]
+    fn test_resource_soil_update_thermal() {
+        let hw = DnaHardwareFingerprint::rtx4090_simulated();
+        let mut soil = ResourceSoil::from_fingerprint(&hw);
+        assert!(!soil.is_thermal_throttling);
+        soil.update_thermal(85.0, 300.0, 80.0);
+        assert!(soil.is_thermal_throttling);
+        assert!((soil.current_temperature_c - 85.0).abs() < 0.01);
+        assert!((soil.current_power_watts - 300.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_exhaust_evaluate_register_pressure() {
+        let hw = DnaHardwareFingerprint::rtx4090_simulated();
+        let mut soil = ResourceSoil::from_fingerprint(&hw);
+        // Load SM 0 past the register prune threshold (0.85)
+        let threshold_regs = (soil.sm_pools[0].total_registers as f64
+            * (soil.exhaust_policy.register_prune_threshold + 0.05)) as u32;
+        // Only consume up to hard ceiling
+        let safe_regs = threshold_regs.min(
+            (soil.sm_pools[0].total_registers as f64 * soil.exhaust_policy.register_hard_ceiling) as u32 - 1
+        );
+        soil.consume(0, safe_regs, 0, 0, 0).unwrap();
+        let events = soil.evaluate_exhaust();
+        let reg_events: Vec<_> = events.iter()
+            .filter(|e| e.trigger == ExhaustTrigger::RegisterPressure && e.sm_index == 0)
+            .collect();
+        assert!(!reg_events.is_empty(), "Expected register pressure event on SM 0");
+    }
+
+    #[test]
+    fn test_exhaust_evaluate_thermal_throttle() {
+        let hw = DnaHardwareFingerprint::rtx4090_simulated();
+        let mut soil = ResourceSoil::from_fingerprint(&hw);
+        soil.update_thermal(85.0, 200.0, 70.0);
+        let events = soil.evaluate_exhaust();
+        let thermal_events: Vec<_> = events.iter()
+            .filter(|e| e.trigger == ExhaustTrigger::ThermalThrottle)
+            .collect();
+        assert!(!thermal_events.is_empty(), "Expected thermal throttle event at 85°C");
+    }
+
+    #[test]
+    fn test_exhaust_evaluate_thermal_emergency() {
+        let hw = DnaHardwareFingerprint::rtx4090_simulated();
+        let mut soil = ResourceSoil::from_fingerprint(&hw);
+        soil.update_thermal(95.0, 350.0, 100.0);
+        let events = soil.evaluate_exhaust();
+        let emergency: Vec<_> = events.iter()
+            .filter(|e| e.trigger == ExhaustTrigger::ThermalEmergency)
+            .collect();
+        assert!(!emergency.is_empty(), "Expected thermal emergency at 95°C");
+        // Emergency action should be ThrottleAllOnSm
+        assert!(matches!(emergency[0].action, PruningAction::ThrottleAllOnSm));
+    }
+
+    #[test]
+    fn test_exhaust_no_events_at_idle() {
+        let hw = DnaHardwareFingerprint::rtx4090_simulated();
+        let soil = ResourceSoil::from_fingerprint(&hw);
+        let events = soil.evaluate_exhaust();
+        assert!(events.is_empty(), "Fresh soil should have no exhaust events");
+    }
+
+    #[test]
+    fn test_exhaust_policy_from_constraints() {
+        let hw = DnaHardwareFingerprint::rtx4090_simulated();
+        let constraints = DnaConstraintMappings::default_system();
+        let policy = ExhaustPolicy::from_hardware_and_constraints(&hw, &constraints);
+        // Should derive register threshold from constraint budget / registers_per_sm
+        assert!(policy.register_prune_threshold > 0.0);
+        assert!(policy.register_prune_threshold <= 0.85);
+        // Latency should match P99 constraint (8.0 us)
+        assert!((policy.latency_prune_us - 8.0).abs() < 0.01);
+        // Nutrient floor should match biological constraint (0.15)
+        assert!((policy.nutrient_critical_floor - 0.15).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_exhaust_policy_default() {
+        let policy = ExhaustPolicy::default();
+        assert!((policy.register_prune_threshold - 0.85).abs() < 0.01);
+        assert!((policy.register_hard_ceiling - 0.95).abs() < 0.01);
+        assert!((policy.thermal_throttle_celsius - 80.0).abs() < 0.01);
+        assert!((policy.thermal_emergency_celsius - 90.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_validate_fiber_launch_within_limits() {
+        let hw = DnaHardwareFingerprint::rtx4090_simulated();
+        let constraints = DnaConstraintMappings::default_system();
+        let soil = ResourceSoil::from_fingerprint(&hw);
+        let fibers = DnaMuscleFiberMap::default_fibers();
+        let fiber = fibers.get("cell_update").unwrap();
+        let violations = soil.validate_fiber_launch(0, fiber, &constraints);
+        assert!(violations.is_empty(),
+            "Default cell_update fiber should be within DNA limits: {:?}", violations);
+    }
+
+    #[test]
+    fn test_validate_fiber_launch_exceeds_register_budget() {
+        let hw = DnaHardwareFingerprint::rtx4090_simulated();
+        let constraints = DnaConstraintMappings::default_system();
+        let soil = ResourceSoil::from_fingerprint(&hw);
+        // Create a fiber that uses too many registers
+        let big_fiber = DnaMuscleFiber {
+            name: "register_hog".into(),
+            description: String::new(),
+            block_size: 256,
+            registers_per_thread: 200, // 256 * 200 = 51200 > 32768 budget
+            shared_memory_bytes: 0,
+            target_occupancy: 0.5,
+            uses_ptx_cas: false,
+            uses_warp_aggregation: false,
+            uses_prefix_sum: false,
+            is_persistent: false,
+            kernel_source: DnaKernelSource::None,
+            expected_p99_us: 1.0,
+            expected_throughput_ops: 1.0,
+            best_measured_latency_us: f64::MAX,
+            worst_measured_latency_us: 0.0,
+            measurement_count: 0,
+        };
+        let violations = soil.validate_fiber_launch(0, &big_fiber, &constraints);
+        assert!(!violations.is_empty());
+        assert!(violations.iter().any(|v| v.contains("register")),
+            "Should flag register budget violation: {:?}", violations);
+    }
+
+    #[test]
+    fn test_validate_fiber_launch_thermal_block() {
+        let hw = DnaHardwareFingerprint::rtx4090_simulated();
+        let constraints = DnaConstraintMappings::default_system();
+        let mut soil = ResourceSoil::from_fingerprint(&hw);
+        soil.update_thermal(95.0, 350.0, 100.0); // Emergency temperature
+        let fibers = DnaMuscleFiberMap::default_fibers();
+        let fiber = fibers.get("cell_update").unwrap();
+        let violations = soil.validate_fiber_launch(0, fiber, &constraints);
+        assert!(violations.iter().any(|v| v.contains("temperature")),
+            "Should block launch at emergency temperature: {:?}", violations);
+    }
+
+    #[test]
+    fn test_validate_fiber_launch_invalid_sm() {
+        let hw = DnaHardwareFingerprint::rtx4090_simulated();
+        let constraints = DnaConstraintMappings::default_system();
+        let soil = ResourceSoil::from_fingerprint(&hw);
+        let fibers = DnaMuscleFiberMap::default_fibers();
+        let fiber = fibers.get("cell_update").unwrap();
+        let violations = soil.validate_fiber_launch(9999, fiber, &constraints);
+        assert!(!violations.is_empty());
+        assert!(violations[0].contains("does not exist"));
+    }
+
+    #[test]
+    fn test_resource_soil_serialization_roundtrip() {
+        let hw = DnaHardwareFingerprint::rtx4090_simulated();
+        let constraints = DnaConstraintMappings::default_system();
+        let mut soil = ResourceSoil::from_fingerprint_and_constraints(&hw, &constraints);
+        soil.consume(0, 1000, 2048, 2, 64).unwrap();
+        soil.update_thermal(72.0, 200.0, 50.0);
+
+        let json = serde_json::to_string(&soil).unwrap();
+        let deserialized: ResourceSoil = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.source_gpu, soil.source_gpu);
+        assert_eq!(deserialized.sm_pools.len(), soil.sm_pools.len());
+        assert_eq!(deserialized.sm_pools[0].used_registers, 1000);
+        assert!((deserialized.current_temperature_c - 72.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_resource_soil_least_loaded_sm() {
+        let hw = DnaHardwareFingerprint::rtx4090_simulated();
+        let mut soil = ResourceSoil::from_fingerprint(&hw);
+        // Load SM 0 heavily
+        let safe_regs = (soil.sm_pools[0].total_registers as f64 * 0.5) as u32;
+        soil.consume(0, safe_regs, 0, 0, 0).unwrap();
+        // SM 1 should be least loaded when excluding SM 0
+        let target = soil.least_loaded_sm_excluding(0);
+        // Any SM other than 0 is acceptable (they're all equally fresh)
+        assert_ne!(target, 0);
+    }
+
+    #[test]
+    fn test_resource_soil_critical_sm_count() {
+        let hw = DnaHardwareFingerprint::rtx4090_simulated();
+        let mut soil = ResourceSoil::from_fingerprint(&hw);
+        assert_eq!(soil.critical_sm_count(), 0);
+        // Push SM 0 past nutrient floor
+        let near_full_regs = (soil.sm_pools[0].total_registers as f64 * 0.90) as u32;
+        soil.consume(0, near_full_regs, 0, 0, 0).unwrap();
+        assert!(soil.sm_pools[0].nutrient_score() < soil.exhaust_policy.nutrient_critical_floor);
+        assert_eq!(soil.critical_sm_count(), 1);
+    }
+
+    #[test]
+    fn test_cli_parse_soil() {
+        let args = vec!["--soil".to_string()];
+        match parse_dna_args(&args) {
+            Some(DnaCliAction::Soil) => {} // expected
+            other => panic!("Expected Soil, got {:?}", other),
         }
     }
 }
