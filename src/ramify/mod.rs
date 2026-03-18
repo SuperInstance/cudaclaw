@@ -53,6 +53,7 @@
 //
 // ============================================================
 
+pub mod nvrtc_compiler;
 pub mod ptx_branching;
 pub mod resource_exhaustion;
 pub mod shared_memory_bridge;
@@ -62,6 +63,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ptx_branching::{
     AccessPattern, BranchRegistry, BranchRegistryStats, CompiledBranch,
+};
+use nvrtc_compiler::{
+    NvrtcCompiler, CompileOptions, CompilationResult, CudaCppTemplate,
 };
 use resource_exhaustion::{
     AgentResourceUsage, ExhaustionAction, ExhaustionThresholds,
@@ -106,6 +110,8 @@ pub struct RamifyConfig {
     pub enable_resource_mgmt: bool,
     /// Whether to enable periodic SM rebalancing.
     pub enable_rebalancing: bool,
+    /// Whether to enable NVRTC runtime compilation for CUDA C++ templates.
+    pub enable_nvrtc: bool,
     /// Rebalancer: maximum nutrient score imbalance before action.
     pub rebalance_max_imbalance: f64,
     /// Rebalancer: minimum improvement to justify migration.
@@ -136,6 +142,7 @@ impl Default for RamifyConfig {
             enable_bridges: true,
             enable_resource_mgmt: true,
             enable_rebalancing: true,
+            enable_nvrtc: true,
             rebalance_max_imbalance: 0.30,
             rebalance_min_improvement: 0.10,
         }
@@ -204,6 +211,12 @@ pub struct RamifyEngine {
     config: RamifyConfig,
     /// PTX branch registry (Lower-Level Branching).
     branch_registry: BranchRegistry,
+    /// NVRTC runtime compiler for CUDA C++ → PTX.
+    nvrtc_compiler: NvrtcCompiler,
+    /// CUDA C++ templates registered for NVRTC compilation.
+    cuda_templates: Vec<CudaCppTemplate>,
+    /// Cached NVRTC compilation results keyed by (template_id, pattern).
+    nvrtc_cache: std::collections::HashMap<String, CompilationResult>,
     /// Shared memory bridge manager (Fast Interconnects).
     bridge_manager: BridgeManager,
     /// Resource exhaustion manager (Soil Nutrients).
@@ -234,6 +247,9 @@ impl RamifyEngine {
                 config.access_window_size,
                 config.grid_cols,
             ),
+            nvrtc_compiler: NvrtcCompiler::new(),
+            cuda_templates: Vec::new(),
+            nvrtc_cache: std::collections::HashMap::new(),
             bridge_manager: BridgeManager::new(
                 config.sm_count,
                 config.shmem_per_sm,
@@ -265,6 +281,85 @@ impl RamifyEngine {
             self.branch_registry
                 .register_template(ptx_branching::default_crdt_merge_template());
         }
+        // Register CUDA C++ templates for NVRTC compilation.
+        if self.config.enable_nvrtc {
+            self.cuda_templates
+                .push(nvrtc_compiler::default_cuda_cell_update_template());
+            self.cuda_templates
+                .push(nvrtc_compiler::default_cuda_crdt_merge_template());
+        }
+    }
+
+    /// Compile a CUDA C++ template via NVRTC for the current pattern.
+    ///
+    /// This is the NVRTC equivalent of `observe_access()` → `compile_for_pattern()`.
+    /// Instead of doing PTX string substitution, it passes the CUDA C++ source
+    /// and pattern-specific constants to NVRTC for real compilation.
+    ///
+    /// Returns compilation results for all matching templates.
+    pub fn compile_nvrtc_for_pattern(
+        &mut self,
+        pattern: &AccessPattern,
+    ) -> Vec<CompilationResult> {
+        if !self.config.enable_nvrtc {
+            return Vec::new();
+        }
+
+        let constants = ptx_branching::constants_for_pattern(pattern);
+        let arch = match self.config.gpu_arch {
+            GpuArch::Volta => "compute_70",
+            GpuArch::Ampere => "compute_80",
+            GpuArch::AdaLovelace => "compute_89",
+        };
+
+        let mut results = Vec::new();
+
+        // Clone template data to avoid borrow conflict with &mut self.
+        let templates: Vec<(String, String, String)> = self
+            .cuda_templates
+            .iter()
+            .filter(|t| {
+                t.target_patterns.is_empty() || t.target_patterns.contains(pattern)
+            })
+            .map(|t| (t.id.clone(), t.source.clone(), t.entry_point.clone()))
+            .collect();
+
+        for (id, source, _entry_point) in &templates {
+            let cache_key = format!("{}_{:?}", id, pattern);
+
+            // Check cache — skip if already compiled for this pattern.
+            if self.nvrtc_cache.contains_key(&cache_key) {
+                continue;
+            }
+
+            let program_name = format!("{}.cu", id);
+            match self.nvrtc_compiler.compile_ramified(
+                source,
+                &program_name,
+                arch,
+                &constants,
+            ) {
+                Ok(result) => {
+                    self.nvrtc_cache.insert(cache_key, result.clone());
+                    results.push(result);
+                }
+                Err(e) => {
+                    eprintln!("NVRTC compilation failed for {}: {}", id, e);
+                }
+            }
+        }
+
+        results
+    }
+
+    /// Get the NVRTC compiler instance.
+    pub fn nvrtc_compiler(&self) -> &NvrtcCompiler {
+        &self.nvrtc_compiler
+    }
+
+    /// Get cached NVRTC compilation results.
+    pub fn nvrtc_cache(&self) -> &std::collections::HashMap<String, CompilationResult> {
+        &self.nvrtc_cache
     }
 
     // --------------------------------------------------------
@@ -608,6 +703,47 @@ pub fn run_demo(config: RamifyConfig) {
         branch_stats.total_recompilations, branch_stats.branches_compiled
     );
 
+    // ── Phase 1b: NVRTC Runtime Compilation ───────────────────
+    println!("━━━ Phase 1b: NVRTC Runtime Compilation ━━━");
+    println!("NVRTC available: {}", engine.nvrtc_compiler().is_available());
+    if let Some((major, minor)) = engine.nvrtc_compiler().version() {
+        println!("NVRTC version:  {}.{}", major, minor);
+    } else {
+        println!("NVRTC version:  N/A (using simulated compilation)");
+    }
+
+    // Compile CUDA C++ templates via NVRTC for the detected pattern.
+    let current_pattern = engine
+        .current_pattern()
+        .unwrap_or(ptx_branching::AccessPattern::Sequential);
+    println!(
+        "\nCompiling CUDA C++ templates via NVRTC for pattern: {:?}...",
+        current_pattern
+    );
+
+    let nvrtc_results = engine.compile_nvrtc_for_pattern(&current_pattern);
+    for result in &nvrtc_results {
+        println!(
+            "  ✦ NVRTC compiled: {} ({} bytes PTX, {:.1}ms, {})",
+            result.program_name,
+            result.ptx.len(),
+            result.compile_time_us as f64 / 1000.0,
+            if result.simulated {
+                "simulated"
+            } else {
+                "real NVRTC"
+            }
+        );
+    }
+
+    let compiler_stats = engine.nvrtc_compiler().stats();
+    println!(
+        "NVRTC stats: {} compiled, {} simulated, avg {:.1}ms\n",
+        compiler_stats.successful_compilations,
+        compiler_stats.simulated_compilations,
+        compiler_stats.avg_compile_time_us / 1000.0
+    );
+
     // ── Phase 2: Shared Memory Bridges ──────────────────────
     println!("━━━ Phase 2: Direct GPU Shared Memory Bridges ━━━");
     println!("Simulating frequent data sharing between agents...");
@@ -772,6 +908,7 @@ pub fn show_status(config: RamifyConfig) {
     println!("Bridges:            {}", if config.enable_bridges { "enabled" } else { "disabled" });
     println!("Resource Mgmt:      {}", if config.enable_resource_mgmt { "enabled" } else { "disabled" });
     println!("Rebalancing:        {}", if config.enable_rebalancing { "enabled" } else { "disabled" });
+    println!("NVRTC:              {}", if config.enable_nvrtc { "enabled" } else { "disabled" });
     println!("Tick Interval:      {:?}", config.tick_interval);
 }
 
@@ -907,6 +1044,62 @@ mod tests {
         let args = vec!["--help".to_string()];
         let action = parse_ramify_args(&args);
         assert!(action.is_none());
+    }
+
+    #[test]
+    fn test_nvrtc_integration() {
+        let mut config = RamifyConfig::default();
+        config.enable_nvrtc = true;
+        config.access_window_size = 64;
+        let mut engine = RamifyEngine::new(config);
+        engine.register_default_templates();
+
+        // Should have registered CUDA C++ templates.
+        assert!(!engine.cuda_templates.is_empty());
+
+        // Compile for a sequential pattern.
+        let results = engine.compile_nvrtc_for_pattern(
+            &ptx_branching::AccessPattern::Sequential,
+        );
+        assert!(!results.is_empty(), "Should compile at least one template");
+
+        // All results should be simulated (no real NVRTC in CI).
+        for result in &results {
+            assert!(result.simulated);
+            assert!(result.ptx.contains(".version 7.0"));
+        }
+
+        // Cache should be populated.
+        assert!(!engine.nvrtc_cache().is_empty());
+
+        // Compiling again for the same pattern should use cache (no new results).
+        let results2 = engine.compile_nvrtc_for_pattern(
+            &ptx_branching::AccessPattern::Sequential,
+        );
+        assert!(results2.is_empty(), "Should use cache on second call");
+
+        // Different pattern should produce new results.
+        let results3 = engine.compile_nvrtc_for_pattern(
+            &ptx_branching::AccessPattern::Random,
+        );
+        assert!(!results3.is_empty(), "Should compile for new pattern");
+    }
+
+    #[test]
+    fn test_nvrtc_disabled() {
+        let mut config = RamifyConfig::default();
+        config.enable_nvrtc = false;
+        let mut engine = RamifyEngine::new(config);
+        engine.register_default_templates();
+
+        // No CUDA C++ templates should be registered.
+        assert!(engine.cuda_templates.is_empty());
+
+        // Compilation should return empty.
+        let results = engine.compile_nvrtc_for_pattern(
+            &ptx_branching::AccessPattern::Sequential,
+        );
+        assert!(results.is_empty());
     }
 
     #[test]
