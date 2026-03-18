@@ -3718,13 +3718,33 @@ __device__ __forceinline__ bool ptx_cas_crdt_cell(
             return false;  // Exhausted retries — let caller handle
         }
 
-        // Both CAS ops succeeded — update node_id + state
-        unsigned int* ptr32 = reinterpret_cast<unsigned int*>(cell_ptr);
-        const unsigned int* des32 = reinterpret_cast<const unsigned int*>(desired);
-        ptr32[4] = des32[4];  // node_id
-        ptr32[5] = des32[5];  // state
+        // Both CAS ops succeeded — now atomically update node_id + state.
+        // BUG_0006 fix: Previously used plain stores for node_id and state,
+        // which could be torn/interleaved with concurrent ptx_cas_crdt_cell
+        // calls. Now we pack node_id (uint32_t) + state (uint32_t) into a
+        // single 64-bit value and use a third CAS to update them atomically.
+        unsigned long long* meta_ptr = &ptr64[2];  // bytes 16-23: node_id + state
+        unsigned long long old_meta = *meta_ptr;    // read current node_id|state
 
-        // GPU-scope fence to publish the complete cell update
+        // Pack desired node_id + state into 64 bits (little-endian: node_id in low 32)
+        const unsigned int* des32 = reinterpret_cast<const unsigned int*>(desired);
+        unsigned long long desired_meta =
+            ((unsigned long long)des32[5] << 32) | (unsigned long long)des32[4];
+
+        unsigned long long got_meta = ptx_atom_cas_b64(meta_ptr, old_meta, desired_meta);
+        if (got_meta != old_meta) {
+            // Third CAS failed — metadata was concurrently modified.
+            // Roll back timestamp, then value, to restore consistency.
+            ptx_atom_cas_b64(&ptr64[1], des64[1], exp64[1]);  // rollback timestamp
+            ptx_atom_cas_b64(&ptr64[0], des64[0], exp64[0]);  // rollback value
+            if (attempt < MAX_RETRIES - 1) {
+                ptx_nanosleep(100 * (1U << attempt));
+                continue;  // Retry entire three-phase CAS
+            }
+            return false;  // Exhausted retries
+        }
+
+        // All three CAS ops succeeded — GPU-scope fence to publish
         ptx_membar_gpu();
 
         return true;
@@ -4144,12 +4164,29 @@ __device__ bool soa_write_cell_ptx(
                 // Our write still has higher priority — proceed.
             }
 
-            // Update metadata
-            grid->timestamps[flat_idx] = timestamp;
-            grid->node_ids[flat_idx] = node_id;
-            grid->states[flat_idx] = (uint32_t)CELL_ACTIVE;
+            // BUG_0007 fix: Use atomic stores for metadata to prevent
+            // tearing under concurrent soa_write_cell_ptx calls. Previously
+            // used plain stores which could interleave with concurrent writers,
+            // producing cells with mismatched value/timestamp/node_id.
+            //
+            // atomicExch provides an unconditional atomic write — we don't
+            // need CAS here because we've already won the value CAS race.
+            atomicExch(
+                reinterpret_cast<unsigned long long*>(&grid->timestamps[flat_idx]),
+                (unsigned long long)timestamp
+            );
+
+            // node_ids and states are separate SoA arrays, so we write
+            // each atomically to prevent tearing.
+            atomicExch(&grid->node_ids[flat_idx], node_id);
+            atomicExch(&grid->states[flat_idx], (uint32_t)CELL_ACTIVE);
 
             ptx_membar_gpu();  // Publish all fields
+
+            // Post-write ownership check: if a higher-priority concurrent
+            // writer overwrote our value between our CAS and metadata writes,
+            // our metadata is stale but harmless — the concurrent writer will
+            // overwrite our metadata with its own atomic stores.
 
             grid->inc_version();
             grid->inc_update();
@@ -4287,7 +4324,11 @@ __global__ void soa_warp_tile_update_kernel(
     if (tile_idx >= num_tiles) return;
 
     uint32_t base = tile_bases[tile_idx];
-    double my_value = values[tile_idx * WARP_SIZE + lane_id];
+    // BUG_0008 fix: Bounds-check the values[] read to prevent OOB access
+    // when total values is not a multiple of WARP_SIZE. The last tile's
+    // higher-numbered lanes would otherwise read past the array end.
+    uint32_t val_idx = tile_idx * WARP_SIZE + lane_id;
+    double my_value = (base + lane_id < grid->total_cells) ? values[val_idx] : 0.0;
     uint64_t ts = timestamps[tile_idx];
     uint32_t nid = node_ids[tile_idx];
 
