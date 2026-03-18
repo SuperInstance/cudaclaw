@@ -4516,7 +4516,10 @@ __device__ uint32_t evaluate_frontier_parallel(
  * This kernel can process thousands of formula cells across hundreds
  * of levels with full GPU occupancy at each level.
  *
- * Launch: <<<1, min(num_cells, 1024), sizeof(ParallelRecalcState)>>>
+ * Launch: <<<1, min(((num_cells+31)/32)*32, 1024), sizeof(ParallelRecalcState)>>>
+ * Block size MUST be a multiple of 32 to avoid partial-warp UB in
+ * warp intrinsics (__shfl_up_sync, __ballot_sync) and to ensure
+ * block_prefix_sum_exclusive writes smem[warp_id] from lane 31.
  * For num_cells > 1024, use multiple blocks with global memory
  * frontier arrays.
  *
@@ -4574,19 +4577,8 @@ __global__ void parallel_formula_recalc_kernel(
         }
 
         // Step 2: Prefix-sum compaction to build frontier
-        uint32_t frontier_count = compact_frontier_prefix_sum(
-            // Use identity mapping (cell indices 0..N-1)
-            // We need an array of candidate indices
-            state->level,  // Reuse level array temporarily as source
-            N,
-            &is_ready,     // Predicate (will be indexed by tid)
-            state->frontier,
-            state->scan_workspace
-        );
-        // Actually, compact_frontier_prefix_sum expects arrays, but we're using
-        // per-thread register values. Let's use a simpler approach:
-
-        // Simpler approach: use block_prefix_sum_exclusive directly
+        // Use block_prefix_sum_exclusive directly (compact_frontier_prefix_sum
+        // expects array predicates, but is_ready is a per-thread register).
         uint32_t my_pos = block_prefix_sum_exclusive(is_ready, state->scan_workspace);
         frontier_count = state->scan_workspace[32];  // Total ready cells
 
@@ -4780,7 +4772,8 @@ __global__ void decrement_dependents_kernel(
  * ready, and uses prefix sum to compact them into a dense frontier
  * array.
  *
- * Launch: <<<1, min(num_cells, 1024)>>>
+ * Launch: <<<1, min(((num_cells+31)/32)*32, 1024)>>>
+ * Block size MUST be a multiple of 32 (see parallel_formula_recalc_kernel).
  *
  * @param in_degree       In-degree array
  * @param level_assigned  Per-cell flag: 1 if already assigned a level
