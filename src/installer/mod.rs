@@ -39,13 +39,17 @@
 
 pub mod hardware_probe;
 pub mod llm_optimizer;
+pub mod micro_simulation;
 pub mod role_profile;
 pub mod simulated_finetuning;
 
 use hardware_probe::{HardwareProfile, HardwareProber};
 use llm_optimizer::{LlmConfig, LlmOptimizer, LlmProvider, OptimizationSuggestion, RoleContext};
+use micro_simulation::{MicroSimConfig, MicroSimEngine, MicroSimResult};
 use role_profile::{ProfileManager, RoleProfile};
 use simulated_finetuning::{SimulationEngine, SimulationReport};
+
+use crate::dna::RamifiedRole;
 
 // ============================================================
 // Installer Configuration
@@ -112,17 +116,17 @@ impl Installer {
         println!("╚══════════════════════════════════════════════════════════════╝\n");
 
         // ── Step 1: Hardware Probe ──────────────────────────
-        println!("Step 1/4: Hardware Probe");
+        println!("Step 1/6: Hardware Probe");
         let hardware = self.run_probe();
         HardwareProber::print_profile(&hardware);
 
         // ── Step 2: Generate Optimization Suggestions ───────
-        println!("\nStep 2/4: Generating Optimization Suggestions");
+        println!("\nStep 2/6: Generating Optimization Suggestions");
         let suggestions = self.generate_suggestions(&hardware).await?;
         println!("  Generated {} suggestions", suggestions.len());
 
         // ── Step 3: Simulated Fine-Tuning ───────────────────
-        println!("\nStep 3/4: Simulated Fine-Tuning");
+        println!("\nStep 3/6: Simulated Fine-Tuning (model-driven)");
         let engine = SimulationEngine::new(
             hardware.clone(),
             self.config.role.clone(),
@@ -136,14 +140,49 @@ impl Installer {
 
         let best_suggestion = &suggestions[best_idx];
 
-        // ── Step 4: Save Role Profile ───────────────────────
-        println!("Step 4/4: Saving Ramified Role Profile");
+        // ── Step 4: Micro-Simulation (5s kernel benchmarks) ─
+        println!("\nStep 4/6: Micro-Simulation (5-second kernel benchmarks)");
+        let micro_engine = MicroSimEngine::new(hardware.clone());
+
+        // Build candidate configs from top suggestions (up to 3)
+        let top_n = results.len().min(3);
+        let top_suggestion_ids: Vec<String> = results[..top_n]
+            .iter()
+            .map(|r| r.suggestion_id.clone())
+            .collect();
+
+        let micro_candidates: Vec<MicroSimConfig> = suggestions
+            .iter()
+            .filter(|s| top_suggestion_ids.contains(&s.suggestion_id))
+            .map(MicroSimConfig::from_suggestion)
+            .collect();
+
+        let narrowing = micro_engine.narrow(&micro_candidates);
+        MicroSimEngine::print_comparison(&narrowing.candidates);
+
+        // Determine the overall winner: prefer micro-sim winner if it
+        // beats baseline, otherwise fall back to model-driven best.
+        let (final_suggestion, final_micro_result) = if narrowing.beats_baseline {
+            // Find the suggestion matching the micro-sim winner
+            let winner = suggestions
+                .iter()
+                .find(|s| s.suggestion_id == narrowing.best_config_id)
+                .unwrap_or(best_suggestion);
+            println!("  Micro-simulation winner: {} (empirical)", narrowing.best_config_id);
+            (winner, Some(narrowing.best_result.clone()))
+        } else {
+            println!("  Baseline held — using model-driven best: {}", best_suggestion.suggestion_id);
+            (best_suggestion, None)
+        };
+
+        // ── Step 5: Save Role Profile ───────────────────────
+        println!("\nStep 5/6: Saving Ramified Role Profile");
         let manager = ProfileManager::new(&self.config.project_root);
 
         let profile = ProfileManager::create_profile(
             &hardware,
             &self.config.role,
-            best_suggestion,
+            final_suggestion,
             &best_result,
             results,
             self.config.llm_config.as_ref(),
@@ -166,7 +205,27 @@ impl Installer {
 
         ProfileManager::print_profile_summary(&profile);
 
-        println!("{}", "═".repeat(64));
+        // ── Step 6: Update .claw-dna (if micro-sim beat baseline) ─
+        println!("\nStep 6/6: DNA Update");
+        if narrowing.beats_baseline {
+            match self.update_claw_dna(
+                &hardware,
+                final_suggestion,
+                final_micro_result.as_ref(),
+            ) {
+                Ok(dna_path) => {
+                    println!("  .claw-dna updated: {}", dna_path);
+                }
+                Err(e) => {
+                    println!("  WARNING: Failed to update .claw-dna: {}", e);
+                    println!("  (Profile was still saved successfully.)");
+                }
+            }
+        } else {
+            println!("  No DNA update — baseline was not beaten.");
+        }
+
+        println!("\n{}", "═".repeat(64));
         println!("  Installation complete!");
         println!("  Profile: {}", path.display());
         if report_path.exists() {
@@ -325,6 +384,130 @@ impl Installer {
         // Only return the requested number of variations
         variations.truncate(self.config.heuristic_variations as usize);
         variations
+    }
+
+    /// Update the `.claw-dna` file with improved muscle fiber settings.
+    ///
+    /// Called when the micro-simulation proves a candidate config beats
+    /// the baseline. Loads or creates the DNA file, updates only the
+    /// muscle fiber parameters, and writes back in-place.
+    fn update_claw_dna(
+        &self,
+        hardware: &HardwareProfile,
+        suggestion: &OptimizationSuggestion,
+        micro_result: Option<&MicroSimResult>,
+    ) -> Result<String, InstallerError> {
+        let dna_dir = self.config.project_root.join(".cudaclaw").join("dna");
+        std::fs::create_dir_all(&dna_dir).map_err(|e| {
+            InstallerError::ProfileError(format!("Failed to create dna dir: {}", e))
+        })?;
+
+        let role_name = &self.config.role.role_name;
+        let hw_short = hardware.gpu_name
+            .to_lowercase()
+            .replace("nvidia", "")
+            .replace("(simulated)", "")
+            .replace("geforce", "")
+            .trim()
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == ' ')
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<&str>>()
+            .join("");
+        let sm_tag = format!("sm{}", hardware.compute_capability.replace('.', ""));
+        let filename = format!("{}_{}.claw-dna", role_name, format!("{}_{}", hw_short, sm_tag));
+        let dna_path = dna_dir.join(&filename);
+        let path_str = dna_path.display().to_string();
+
+        // Load existing DNA or create a new default
+        let mut dna = if dna_path.exists() {
+            RamifiedRole::load_from_file(&path_str).unwrap_or_else(|_| {
+                RamifiedRole::default_spreadsheet_engine()
+            })
+        } else {
+            let mut d = RamifiedRole::default_spreadsheet_engine();
+            d.role = role_name.clone();
+            d.name = format!("{}_{}", role_name, format!("{}_{}", hw_short, sm_tag));
+            d
+        };
+
+        // Update muscle fibers from the winning suggestion
+        self.apply_suggestion_to_fibers(&mut dna, suggestion, micro_result);
+
+        // Record the mutation
+        dna.record_mutation(&format!(
+            "Installer micro-simulation win: {} (P99={:.2}us, Throughput={:.0}cmd/s)",
+            suggestion.suggestion_id,
+            micro_result.map(|r| r.p99_latency_us).unwrap_or(0.0),
+            micro_result.map(|r| r.throughput_cmds_per_sec).unwrap_or(0.0),
+        ));
+
+        // Write back in-place
+        dna.save_to_file(&path_str).map_err(|e| {
+            InstallerError::ProfileError(format!("Failed to save DNA: {}", e))
+        })?;
+
+        Ok(path_str)
+    }
+
+    /// Apply an OptimizationSuggestion's parameters to the DNA's muscle fibers.
+    ///
+    /// Updates existing fibers in-place (block_size, shared_memory_bytes, etc.)
+    /// without changing the kernel source, description, or name.
+    fn apply_suggestion_to_fibers(
+        &self,
+        dna: &mut RamifiedRole,
+        suggestion: &OptimizationSuggestion,
+        micro_result: Option<&MicroSimResult>,
+    ) {
+        // Map suggestion fields to the relevant fiber task IDs.
+        // The persistent-worker kernel maps to "idle_poll" and "cell_update".
+        let fiber_ids = ["cell_update", "crdt_merge", "idle_poll"];
+
+        for task_id in &fiber_ids {
+            if let Some(fiber) = dna.muscle_fibers.get_mut(task_id) {
+                // Update launch parameters from the suggestion
+                fiber.block_size = suggestion.block_size;
+                fiber.shared_memory_bytes = suggestion.shared_memory_bytes;
+                fiber.uses_warp_aggregation = suggestion.enable_warp_aggregation;
+
+                // Task-specific overrides
+                match *task_id {
+                    "idle_poll" => {
+                        // Persistent poller: always single warp
+                        fiber.block_size = 32;
+                        fiber.is_persistent = true;
+                    }
+                    "crdt_merge" => {
+                        // CRDT merge always needs PTX CAS
+                        fiber.uses_ptx_cas = true;
+                    }
+                    _ => {}
+                }
+
+                // Record micro-simulation measurements if available
+                if let Some(result) = micro_result {
+                    fiber.measurement_count += 1;
+                    if result.p99_latency_us < fiber.best_measured_latency_us {
+                        fiber.best_measured_latency_us = result.p99_latency_us;
+                    }
+                    if result.p99_latency_us > fiber.worst_measured_latency_us {
+                        fiber.worst_measured_latency_us = result.p99_latency_us;
+                    }
+                    fiber.expected_p99_us = result.p99_latency_us;
+                    fiber.expected_throughput_ops = result.throughput_cmds_per_sec;
+                }
+            }
+        }
+
+        // Also update the "batch_process" fiber with throughput-oriented params
+        if let Some(fiber) = dna.muscle_fibers.get_mut("batch_process") {
+            // Batch processor benefits from larger block sizes
+            fiber.block_size = suggestion.block_size.max(256);
+            fiber.shared_memory_bytes = suggestion.shared_memory_bytes;
+            fiber.uses_warp_aggregation = suggestion.enable_warp_aggregation;
+        }
     }
 
     /// List all saved profiles.
