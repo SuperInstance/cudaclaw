@@ -41,29 +41,32 @@ fn main() {
 
             println!("cargo:warning=Compiling CUDA kernel: {:?}", cu_path);
 
-            // Find VS 2019 Build Tools compiler
             let compiler_bindir = "C:\\Program Files (x86)\\Microsoft Visual Studio\\2019\\BuildTools\\VC\\Tools\\MSVC\\14.29.30133\\bin\\HostX64\\x64";
-
-            let output = Command::new("nvcc")
-                .arg("-ptx")
+            let mut command = Command::new("nvcc");
+            command.arg("-ptx")
                 .arg(&cu_path)
                 .arg("-o")
                 .arg(&ptx_path)
-                .arg("--compiler-bindir")
-                .arg(compiler_bindir)
-                .arg("-std=c++14")  // Required for atomic operations
-                .arg("-Xcompiler").arg("/wd4819")  // Suppress warnings about charset
-                .output();
+                .arg("-std=c++14")
+                .arg("-Xcompiler").arg("/wd4819");
+
+            if Path::new(compiler_bindir).exists() {
+                command.arg("--compiler-bindir").arg(compiler_bindir);
+            }
+
+            let output = command.output();
 
             match output {
                 Ok(o) if o.status.success() => {
                     println!("cargo:warning=Successfully compiled {:?}", cu_path);
                 }
                 Ok(o) => {
+                    let stdout = String::from_utf8_lossy(&o.stdout);
                     let stderr = String::from_utf8_lossy(&o.stderr);
                     panic!(
-                        "nvcc failed to compile {:?}:\n{}",
+                        "nvcc failed to compile {:?}:\n--- stdout ---\n{}\n--- stderr ---\n{}",
                         cu_path,
+                        stdout,
                         stderr
                     );
                 }

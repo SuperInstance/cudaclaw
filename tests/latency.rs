@@ -71,8 +71,8 @@ const QUEUE_SIZE: u32 = 16;
 /// Physical buffer capacity matching src/cuda_claw.rs QUEUE_SIZE.
 const BUFFER_SIZE: usize = 1024;
 
-/// Mirrors Command in src/cuda_claw.rs (#[repr(C, packed(4))], 48 bytes)
-#[repr(C, packed(4))]
+/// Mirrors Command in src/cuda_claw.rs (#[repr(C, packed(8))], 48 bytes)
+#[repr(C, packed(8))]
 #[derive(Debug, Clone, Copy)]
 struct Command {
     cmd_type:    u32,
@@ -89,10 +89,10 @@ struct Command {
 
 const _: [(); std::mem::size_of::<Command>()] = [(); 48];
 
-/// Mirrors CommandQueueHost in src/cuda_claw.rs (49,192 bytes, packed(4)).
+/// Mirrors CommandQueueHost in src/cuda_claw.rs (49,192 bytes, packed(8)).
 /// Field order: buffer first, then metadata — matching the production
 /// binary layout used for CUDA unified memory.
-#[repr(C, packed(4))]
+#[repr(C, packed(8))]
 struct CommandQueueHost {
     buffer:              [Command; BUFFER_SIZE],  // offset 0,     48,992 bytes
     status:              u32,                     // offset 48,992, 4 bytes

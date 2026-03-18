@@ -161,12 +161,7 @@ impl LockFreeCommandQueue {
     ///     id: 1,
     ///     timestamp: 12345,
     ///     data_a: 10.0,
-    ///     data_b: 20.0,
-    ///     result: 0.0,
-    ///     batch_data: 0,
-    ///     batch_count: 0,
-    ///     _padding: 0,
-    ///     result_code: 0,
+    ///     data_b: 0.0,
     /// };
     ///
     /// if LockFreeCommandQueue::push_command(&mut queue, cmd) {
@@ -481,12 +476,9 @@ mod tests {
             id: 1,
             timestamp: 0,
             data_a: 10.0,
-            data_b: 20.0,
+            data_b: i as f32 * 20.0,
             result: 0.0,
             batch_data: 0,
-            batch_count: 0,
-            _padding: 0,
-            result_code: 0,
         };
 
         assert!(LockFreeCommandQueue::push_command(&mut queue, cmd));
@@ -506,9 +498,6 @@ mod tests {
             data_b: 0.0,
             result: 0.0,
             batch_data: 0,
-            batch_count: 0,
-            _padding: 0,
-            result_code: 0,
         };
 
         // Fill queue to capacity (QUEUE_SIZE - 1 to distinguish full from empty)
@@ -535,9 +524,6 @@ mod tests {
             data_b: 0.0,
             result: 0.0,
             batch_data: 0,
-            batch_count: 0,
-            _padding: 0,
-            result_code: 0,
         };
 
         let commands = vec![cmd; 5];
