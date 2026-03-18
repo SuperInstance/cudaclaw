@@ -40,12 +40,14 @@
 pub mod hardware_probe;
 pub mod llm_optimizer;
 pub mod micro_simulation;
+pub mod nvrtc_muscle_compiler;
 pub mod role_profile;
 pub mod simulated_finetuning;
 
 use hardware_probe::{HardwareProfile, HardwareProber};
 use llm_optimizer::{LlmConfig, LlmOptimizer, LlmProvider, OptimizationSuggestion, RoleContext};
 use micro_simulation::{MicroSimConfig, MicroSimEngine, MicroSimResult};
+use nvrtc_muscle_compiler::MuscleFiberCompiler;
 use role_profile::{ProfileManager, RoleProfile};
 use simulated_finetuning::{SimulationEngine, SimulationReport};
 
@@ -140,6 +142,23 @@ impl Installer {
 
         let best_suggestion = &suggestions[best_idx];
 
+        // ── Step 3.5: NVRTC Muscle Fiber Compilation ──────────
+        println!("\nStep 3.5/6: NVRTC Muscle Fiber Compilation");
+        println!("  Compiling LLM-suggested constants into PTX via NVRTC...");
+        let mut muscle_compiler = MuscleFiberCompiler::new(hardware.clone());
+        if muscle_compiler.is_nvrtc_available() {
+            println!("  NVRTC available — real compilation");
+        } else {
+            println!("  NVRTC not available — simulated compilation");
+        }
+        let muscle_compilations = muscle_compiler.compile_all(&suggestions);
+        MuscleFiberCompiler::print_compilation_summary(&muscle_compilations);
+        println!(
+            "  Compiled {} / {} suggestions into PTX muscle fibers",
+            muscle_compilations.len(),
+            suggestions.len()
+        );
+
         // ── Step 4: Micro-Simulation (5s kernel benchmarks) ─
         println!("\nStep 4/6: Micro-Simulation (5-second kernel benchmarks)");
         let micro_engine = MicroSimEngine::new(hardware.clone());
@@ -205,24 +224,42 @@ impl Installer {
 
         ProfileManager::print_profile_summary(&profile);
 
-        // ── Step 6: Update .claw-dna (if micro-sim beat baseline) ─
-        println!("\nStep 6/6: DNA Update");
+        // ── Step 6: Ramify DNA (if micro-sim beat baseline) ─
+        println!("\nStep 6/6: Ramify DNA");
         if narrowing.beats_baseline {
+            println!("  Micro-simulation winner beats baseline — ramifying DNA...");
+
+            // Find the NVRTC compilation for the winning suggestion
+            let winning_compilation = muscle_compilations
+                .iter()
+                .find(|c| c.suggestion_id == final_suggestion.suggestion_id);
+
+            if let Some(compilation) = winning_compilation {
+                println!(
+                    "  NVRTC muscle fiber for winner: {} ({} bytes PTX, {})",
+                    compilation.suggestion_id,
+                    compilation.compilation.ptx.len(),
+                    if compilation.simulated { "simulated" } else { "real NVRTC" }
+                );
+            }
+
             match self.update_claw_dna(
                 &hardware,
                 final_suggestion,
                 final_micro_result.as_ref(),
+                winning_compilation,
             ) {
                 Ok(dna_path) => {
-                    println!("  .claw-dna updated: {}", dna_path);
+                    println!("  .claw-dna ramified: {}", dna_path);
                 }
                 Err(e) => {
-                    println!("  WARNING: Failed to update .claw-dna: {}", e);
+                    println!("  WARNING: Failed to ramify .claw-dna: {}", e);
                     println!("  (Profile was still saved successfully.)");
                 }
             }
         } else {
             println!("  No DNA update — baseline was not beaten.");
+            println!("  Current .claw-dna constants remain unchanged.");
         }
 
         println!("\n{}", "═".repeat(64));
@@ -391,11 +428,16 @@ impl Installer {
     /// Called when the micro-simulation proves a candidate config beats
     /// the baseline. Loads or creates the DNA file, updates only the
     /// muscle fiber parameters, and writes back in-place.
+    ///
+    /// If an NVRTC compilation was produced for the winning suggestion,
+    /// the compiled PTX is stored in the DNA's muscle fiber kernel_source
+    /// field so it can be loaded directly at runtime without recompilation.
     fn update_claw_dna(
         &self,
         hardware: &HardwareProfile,
         suggestion: &OptimizationSuggestion,
         micro_result: Option<&MicroSimResult>,
+        nvrtc_compilation: Option<&nvrtc_muscle_compiler::MuscleFiberCompilation>,
     ) -> Result<String, InstallerError> {
         let dna_dir = self.config.project_root.join(".cudaclaw").join("dna");
         std::fs::create_dir_all(&dna_dir).map_err(|e| {
@@ -435,12 +477,38 @@ impl Installer {
         // Update muscle fibers from the winning suggestion
         self.apply_suggestion_to_fibers(&mut dna, suggestion, micro_result);
 
-        // Record the mutation
+        // If NVRTC compilation is available, store the compiled PTX
+        // in the winning fiber's kernel_source so it can be loaded
+        // at runtime without recompilation.
+        if let Some(compilation) = nvrtc_compilation {
+            // Store NVRTC-compiled PTX in the cell_update fiber
+            // (the primary persistent-worker kernel)
+            if let Some(fiber) = dna.muscle_fibers.get_mut("cell_update") {
+                fiber.kernel_source = crate::dna::DnaKernelSource::NvrtcSource {
+                    source: compilation.compilation.ptx.clone(),
+                    program_name: format!("muscle_{}.cu", compilation.suggestion_id),
+                    gpu_arch: compilation.target_arch.clone(),
+                    defines: compilation.injected_constants.clone(),
+                    extra_flags: Vec::new(),
+                    max_registers: 0,
+                    use_fast_math: false,
+                };
+            }
+        }
+
+        // Record the mutation with NVRTC context
+        let nvrtc_info = nvrtc_compilation
+            .map(|c| format!(", NVRTC={} ({} bytes PTX)",
+                if c.simulated { "simulated" } else { "real" },
+                c.compilation.ptx.len()))
+            .unwrap_or_default();
+
         dna.record_mutation(&format!(
-            "Installer micro-simulation win: {} (P99={:.2}us, Throughput={:.0}cmd/s)",
+            "Installer micro-simulation win: {} (P99={:.2}us, Throughput={:.0}cmd/s{})",
             suggestion.suggestion_id,
             micro_result.map(|r| r.p99_latency_us).unwrap_or(0.0),
             micro_result.map(|r| r.throughput_cmds_per_sec).unwrap_or(0.0),
+            nvrtc_info,
         ));
 
         // Write back in-place
