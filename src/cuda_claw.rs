@@ -362,14 +362,19 @@ impl CudaClawExecutor {
         let queue_ptr = self.queue.as_device_ptr();
         let stream = &self.stream;
 
-        // Launch configuration: 1 block, 256 threads
-        // This keeps the kernel resident on a single Streaming Multiprocessor (SM)
-        // Thread 0 of block 0 manages the queue, remaining threads available
-        // for future parallel processing of commands
+        // Launch configuration: 1 block, 32 threads (one full warp).
+        // The persistent_worker signature is:
+        //   persistent_worker(CommandQueue* queue, CRDTState* crdt)
+        // We pass nullptr for crdt — the kernel null-guards this pointer
+        // and falls back to printf-only logging when crdt is absent.
+        // To enable SmartCRDT, allocate a CRDTState in Unified Memory and
+        // pass its device pointer here instead of 0usize.
+        let crdt_ptr: usize = 0; // nullptr — SmartCRDT disabled until CRDTState is allocated
         unsafe {
             launch!(
-                func<<<1, 256, 0, stream>>>(
-                    queue_ptr
+                func<<<1, 32, 0, stream>>>(
+                    queue_ptr,
+                    crdt_ptr
                 )
             )?;
         }

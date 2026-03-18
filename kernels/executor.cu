@@ -145,15 +145,22 @@ __device__ void smartcrdt_trigger_recalc(
     uint64_t timestamp,
     uint32_t node_id
 ) {
+    // Guard: uninitialized CRDT (rows/cols/total_cells == 0) would cause
+    // division by zero inside warp_recalculate_cells when converting flat
+    // indices to (row, col). Return early — nothing to recalculate.
+    if (crdt->rows == 0 || crdt->cols == 0 || crdt->total_cells == 0) return;
+
     uint32_t total_cells = crdt->total_cells;
 
     // Build a warp-width frontier of cells to recalculate.
     // Each lane recalculates cell_id + lane_id (the same burst
     // pattern as the write, covering the dependency neighborhood).
+    // Out-of-bounds lanes are skipped (UINT32_MAX sentinel) rather than
+    // clamped to cell 0, which would cause unintended writes to A1.
     uint32_t cell_indices[WARP_SIZE];
     for (int i = 0; i < WARP_SIZE; i++) {
         uint32_t idx = cell_id + i;
-        cell_indices[i] = (total_cells > 0 && idx < total_cells) ? idx : 0;
+        cell_indices[i] = (idx < total_cells) ? idx : UINT32_MAX;
     }
 
     // warp_recalculate_cells() uses __ballot_sync internally to

@@ -394,14 +394,30 @@ impl MuscleFiberCompiler {
 #endif
 
 // ── Ring Buffer Types ──────────────────────────────────────
+// Layout MUST match kernels/shared_types.h exactly.
+// Field order: buffer first (48,992 bytes), then status/head/tail/is_running.
+// head and tail are 32-bit (uint32_t), NOT 64-bit.
+// Any deviation causes wrong-offset reads/writes at runtime.
+
+#pragma pack(push, 4)
+struct Command {{
+    unsigned int cmd_type;   // offset 0,  4 bytes
+    unsigned int _padding;   // offset 4,  4 bytes
+    unsigned char data[40];  // offset 8, 40 bytes  (union payload)
+}};  // 48 bytes per command
 
 struct CommandQueue {{
-    volatile unsigned int is_running;
-    volatile unsigned long long head;
-    volatile unsigned long long tail;
-    volatile unsigned int status;
-    float buffer[1024 * 12];  // Command data (SoA or AoS)
+    Command buffer[1024];           // offset 0,      48,992 bytes
+    volatile unsigned int status;   // offset 48,992,  4 bytes
+    volatile unsigned int head;     // offset 48,996,  4 bytes (32-bit, not 64-bit)
+    volatile unsigned int tail;     // offset 49,000,  4 bytes (32-bit, not 64-bit)
+    volatile bool is_running;       // offset 49,004,  1 byte
+    unsigned char _padding[3];      // offset 49,005,  3 bytes
+    volatile unsigned long long commands_sent;      // offset 49,008, 8 bytes
+    volatile unsigned long long commands_processed; // offset 49,016, 8 bytes
+    unsigned char _stats_padding[8];                // offset 49,024, 8 bytes
 }};
+#pragma pack(pop)
 
 // ── L1/L2 Cache Preference Helper ──────────────────────────
 
@@ -476,12 +492,14 @@ extern "C" __global__ void persistent_worker_muscle(CommandQueue* queue) {{
     }}
     __syncthreads();
 
-    unsigned long long local_tail = 0;
+    // Initialize local_tail from the queue's current tail so we don't
+    // replay already-consumed commands on restart (BUG fix: was hardcoded 0).
+    unsigned int local_tail = queue->tail;
 
     // ── Main persistent polling loop ──────────────────────
     while (queue->is_running) {{
         // Phase 1: Lane 0 polls the head index
-        unsigned long long current_head = 0;
+        unsigned int current_head = 0;
         if (lane == 0) {{
             current_head = queue->head;
             __threadfence_system();  // PCIe fence for instant visibility
@@ -491,7 +509,7 @@ extern "C" __global__ void persistent_worker_muscle(CommandQueue* queue) {{
         current_head = __shfl_sync(0xFFFFFFFF, current_head, 0);
 
         // Phase 3: Check for new commands
-        if (current_head <= local_tail) {{
+        if (current_head == local_tail) {{
             // No new commands — idle sleep
             #if __CUDA_ARCH__ >= 700
             __nanosleep(CUDACLAW_IDLE_SLEEP_NS);
@@ -500,38 +518,34 @@ extern "C" __global__ void persistent_worker_muscle(CommandQueue* queue) {{
         }}
 
         // Phase 4: Process command batch with unrolled loop
-        unsigned long long cmds_available = current_head - local_tail;
-        unsigned long long batch = cmds_available;
+        unsigned int cmds_available = (current_head - local_tail + 1024u) % 1024u;
+        unsigned int batch = cmds_available;
         if (batch > CUDACLAW_CMD_BATCH_SIZE) {{
             batch = CUDACLAW_CMD_BATCH_SIZE;
         }}
 
         #pragma unroll CUDACLAW_UNROLL_FACTOR
-        for (unsigned long long b = 0; b < batch; b++) {{
-            unsigned long long cmd_idx = (local_tail + b) % 1024;
+        for (unsigned int b = 0; b < batch; b++) {{
+            unsigned int cmd_idx = (local_tail + b) % 1024u;
 
-#if CUDACLAW_SOA_LAYOUT
-            // SoA layout: coalesced memory access
-            // Adjacent threads read adjacent elements
-            float data = queue->buffer[cmd_idx * 12 + lane % 12];
-            // Cache in shared memory for reuse
-            if (lane < 12) {{
-                shmem_cache[(cmd_idx % (CUDACLAW_SHARED_MEM_BYTES / sizeof(float) / 12)) * 12 + lane] = data;
+            // Read cmd_type from the Command struct at cmd_idx
+            unsigned int cmd_type = queue->buffer[cmd_idx].cmd_type;
+
+            // Cache cmd_type in shared memory for warp-level reuse
+            if (lane == 0) {{
+                shmem_cache[cmd_idx % (CUDACLAW_SHARED_MEM_BYTES / sizeof(float))] =
+                    (float)cmd_type;
             }}
-#else
-            // AoS layout: each thread reads its command's data
-            float data = queue->buffer[cmd_idx * 12 + lane % 12];
-#endif
 
             // Process the command (simplified cell update)
             if (lane == 0 && warp_id == 0) {{
-                // Write completion
-                queue->tail = local_tail + b + 1;
+                // Advance tail to signal completion
+                queue->tail = (local_tail + b + 1u) % 1024u;
                 __threadfence_system();
             }}
         }}
 
-        local_tail += batch;
+        local_tail = (local_tail + batch) % 1024u;
 
         __syncwarp();
     }}
@@ -555,12 +569,18 @@ extern "C" __global__ void formula_recalc_muscle(
 
     int tid = blockIdx.x * CUDACLAW_BLOCK_SIZE + threadIdx.x;
 
-    // Load frontier cells into shared memory
+    // Load frontier cells into shared memory.
+    // local_cells[i] holds the value of frontier[i] — indexed by frontier
+    // position, NOT by global cell ID. Dependency lookups below must use
+    // global memory (cells[dep_idx]) to avoid reading wrong shmem slots.
     #pragma unroll CUDACLAW_UNROLL_FACTOR
-    for (int i = threadIdx.x; i < CUDACLAW_FRONTIER_BATCH && i < frontier_size;
+    for (int i = threadIdx.x;
+         i < CUDACLAW_FRONTIER_BATCH &&
+         i < frontier_size &&
+         i < (CUDACLAW_SHARED_MEM_BYTES / (int)sizeof(float));
          i += CUDACLAW_BLOCK_SIZE) {{
         int cell_idx = frontier[i];
-        if (cell_idx < total_cells) {{
+        if (cell_idx >= 0 && cell_idx < total_cells) {{
             local_cells[i] = cells[cell_idx];
         }}
     }}
@@ -579,12 +599,12 @@ extern "C" __global__ void formula_recalc_muscle(
             for (int d = 0; d < dep_count; d++) {{
                 int dep_idx = dep_graph[(total_cells * 2) + dep_start + d];
                 if (dep_idx >= 0 && dep_idx < total_cells) {{
-                    // Try shared memory first, fall back to global
-                    if (dep_idx < CUDACLAW_FRONTIER_BATCH) {{
-                        sum += local_cells[dep_idx];
-                    }} else {{
-                        sum += cells[dep_idx];
-                    }}
+                    // Always read from global memory. local_cells[] is indexed
+                    // by frontier position (0..frontier_size), not by global
+                    // cell ID, so using dep_idx as a shmem index would read
+                    // wrong/uninitialized slots when dep_idx is not in the
+                    // frontier. Global reads are safe and correct here.
+                    sum += cells[dep_idx];
                 }}
             }}
 
