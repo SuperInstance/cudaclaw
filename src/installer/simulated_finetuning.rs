@@ -188,16 +188,17 @@ impl SimulationEngine {
         };
 
         // Atomic CAS overhead (if warp aggregation enabled)
+        // 1e9 / ops_per_sec already yields nanoseconds-per-op.
+        // (Previously this was multiplied by 1e9 again — a double
+        // unit-conversion that inflated CAS latency by 10^9×.)
         let atomic_ns = if s.enable_warp_aggregation {
             // Warp-aggregated: only 1 lane does CAS → no contention
-            let cas_latency = 1_000_000_000.0
-                / self.hardware.atomic_throughput.cas_zero_contention_ops_per_sec;
-            cas_latency * 1e9 // Convert to ns
+            1_000_000_000.0
+                / self.hardware.atomic_throughput.cas_zero_contention_ops_per_sec
         } else {
             // Every lane does CAS → warp-level contention
-            let cas_latency = 1_000_000_000.0
-                / self.hardware.atomic_throughput.cas_warp_contention_ops_per_sec;
-            cas_latency * 1e9
+            1_000_000_000.0
+                / self.hardware.atomic_throughput.cas_warp_contention_ops_per_sec
         };
 
         // L1 cache preference effect

@@ -364,12 +364,19 @@ extern "C" __global__ void persistent_worker(CommandQueue* queue) {
             }
 
             case SHUTDOWN:
-                // SHUTDOWN command in the queue itself
+                // SHUTDOWN command in the queue itself.
+                // Advance tail and set is_running=false BEFORE breaking
+                // out of the while(true) loop, so no extra iteration can
+                // process a post-SHUTDOWN command.
                 if (lane_id == 0) {
+                    uint32_t tail = queue->tail;
+                    queue->tail = tail + 1;
+                    queue->commands_processed++;
+                    queue->is_running = false;
+                    __threadfence_system();
+
                     printf("[GPU] ══════════════════════════════════════════════════════\n");
                     printf("[GPU] SHUTDOWN command received\n");
-                    printf("[GPU] Initiating graceful shutdown...\n");
-                    queue->is_running = false;
                     printf("[GPU] Final statistics:\n");
                     printf("[GPU]   Commands sent:      %llu\n",
                            (unsigned long long)queue->commands_sent);
@@ -377,7 +384,9 @@ extern "C" __global__ void persistent_worker(CommandQueue* queue) {
                            (unsigned long long)queue->commands_processed);
                     printf("[GPU] ══════════════════════════════════════════════════════\n");
                 }
-                break;
+                // All 32 lanes exit the persistent loop immediately.
+                // goto is used to break out of both the switch and while.
+                goto kernel_exit;
 
             default:
                 if (lane_id == 0) {
@@ -389,6 +398,8 @@ extern "C" __global__ void persistent_worker(CommandQueue* queue) {
         // ============================================================
         // PHASE 5: Lane 0 advances tail and updates statistics
         // ============================================================
+        // (Skipped for SHUTDOWN — handled inline above to avoid an
+        // extra loop iteration that could process a post-SHUTDOWN cmd.)
         if (lane_id == 0) {
             uint32_t tail = queue->tail;
             // Use monotonic (unwrapped) tail to match the host's monotonic
@@ -404,6 +415,8 @@ extern "C" __global__ void persistent_worker(CommandQueue* queue) {
             __threadfence_system();
         }
     }
+
+kernel_exit:
 
     // ============================================================
     // KERNEL EXIT: Final cleanup (lane 0 only)

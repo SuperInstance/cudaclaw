@@ -4126,7 +4126,25 @@ __device__ bool soa_write_cell_ptx(
         unsigned long long old = ptx_atom_cas_b64(val_ptr, cur_bits, new_bits);
 
         if (old == cur_bits) {
-            // Value CAS succeeded — update metadata
+            // Value CAS succeeded — but we must re-check priority
+            // to guard against a TOCTOU race: another thread may have
+            // written a higher-timestamp update between our priority
+            // check and the CAS. If the timestamp was concurrently
+            // updated, roll back the value CAS and retry.
+            uint64_t recheck_ts = grid->timestamps[flat_idx];
+            uint32_t recheck_node = grid->node_ids[flat_idx];
+            if (recheck_ts != cur_ts || recheck_node != cur_node) {
+                // Metadata changed concurrently — re-check priority
+                if (compare_timestamps(recheck_ts, recheck_node, timestamp, node_id)) {
+                    // The concurrent write has higher priority.
+                    // Roll back: CAS the value back to the old bits.
+                    ptx_atom_cas_b64(val_ptr, new_bits, cur_bits);
+                    return false;
+                }
+                // Our write still has higher priority — proceed.
+            }
+
+            // Update metadata
             grid->timestamps[flat_idx] = timestamp;
             grid->node_ids[flat_idx] = node_id;
             grid->states[flat_idx] = (uint32_t)CELL_ACTIVE;
@@ -4409,10 +4427,15 @@ __device__ uint32_t block_prefix_sum_exclusive(
     __syncthreads();
 
     // Step 3: Warp 0 scans the warp totals
-    if (warp_id == 0 && lane_id < num_warps) {
-        uint32_t warp_total = smem[lane_id];
+    // All 32 lanes in warp 0 must participate in __shfl_up_sync(WARP_MASK).
+    // Lanes with lane_id >= num_warps pass val=0 so they contribute nothing
+    // but satisfy the full-warp participation requirement.
+    if (warp_id == 0) {
+        uint32_t warp_total = (lane_id < num_warps) ? smem[lane_id] : 0;
         uint32_t scanned = warp_prefix_sum_exclusive(warp_total);
-        smem[lane_id] = scanned;
+        if (lane_id < num_warps) {
+            smem[lane_id] = scanned;
+        }
     }
     __syncthreads();
 
