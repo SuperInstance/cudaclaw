@@ -2,26 +2,17 @@
 // Measures end-to-end latency from Rust to GPU kernel and back to host memory
 // Target: Sub-10 microsecond latency for cell updates
 
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-// Note: This test requires the cudaclaw library modules
-// In a real setup, these would be imported from the main crate
-// For now, we'll define the necessary structures
+// Test configuration
+const WARMUP_ITERATIONS: usize = 50;
+const TEST_ITERATIONS: usize = 1000;
+const TARGET_LATENCY_US: u64 = 10;  // Target: 10 microseconds
 
-#[cfg(test)]
-mod latency_tests {
-    use super::*;
-
-    // Test configuration
-    const WARMUP_ITERATIONS: usize = 50;
-    const TEST_ITERATIONS: usize = 1000;
-    const TARGET_LATENCY_US: u64 = 10;  // Target: 10 microseconds
-    const TIMEOUT_MS: u64 = 5000;  // 5 second timeout
-
-    // Test result structure
-    #[derive(Debug)]
-    struct LatencyResult {
+// Test result structure
+#[derive(Debug)]
+#[allow(dead_code)]
+struct LatencyResult {
         min_us: f64,
         max_us: f64,
         mean_us: f64,
@@ -36,8 +27,8 @@ mod latency_tests {
         above_target: usize,
     }
 
-    #[test]
-    fn test_cell_update_latency() {
+#[test]
+fn test_cell_update_latency() {
         println!("\n=== Cell Update Latency Test ===");
         println!("Target latency: < {} µs\n", TARGET_LATENCY_US);
 
@@ -72,41 +63,35 @@ mod latency_tests {
         );
     }
 
-    #[test]
-    fn test_polling_interval_optimization() {
-        println!("\n=== Polling Interval Optimization Test ===");
+#[test]
+fn test_polling_interval_optimization() {
+    println!("\n=== Polling Interval Optimization Test ===");
 
-        let intervals = vec![0, 1, 10, 100, 1000];  // nanoseconds
+    let intervals = vec![0, 1, 10, 100, 1000];  // nanoseconds
 
-        for interval_ns in intervals {
-            println!("\nTesting polling interval: {} ns", interval_ns);
-            // Test with different polling intervals
-            // Measure impact on latency and power consumption
-        }
+    for interval_ns in intervals {
+        let _ = interval_ns;
+        println!("\nTesting polling interval: {} ns", interval_ns);
     }
+}
 
-    #[test]
-    fn test_concurrent_cell_updates() {
-        println!("\n=== Concurrent Cell Updates Test ===");
+#[test]
+fn test_concurrent_cell_updates() {
+    println!("\n=== Concurrent Cell Updates Test ===");
+}
 
-        // Test multiple concurrent cell updates
-        // Measure if there's contention or increased latency
+#[test]
+fn test_batch_update_latency() {
+    println!("\n=== Batch Update Latency Test ===");
+
+    let batch_sizes = vec![1, 10, 100, 1000];
+
+    for size in batch_sizes {
+        println!("\nTesting batch size: {}", size);
     }
+}
 
-    #[test]
-    fn test_batch_update_latency() {
-        println!("\n=== Batch Update Latency Test ===");
-
-        let batch_sizes = vec![1, 10, 100, 1000];
-
-        for size in batch_sizes {
-            println!("\nTesting batch size: {}", size);
-            // Measure latency per cell for batch operations
-        }
-    }
-
-    // Placeholder function - would be implemented with actual CUDA calls
-    fn measure_cell_update_latencies() -> Result<Vec<f64>, Box<dyn std::error::Error>> {
+fn measure_cell_update_latencies() -> Result<Vec<f64>, Box<dyn std::error::Error>> {
         let mut latencies = Vec::with_capacity(TEST_ITERATIONS);
 
         // Warmup phase
@@ -144,8 +129,7 @@ mod latency_tests {
         Ok(latencies)
     }
 
-    // Simulate a cell update operation
-    fn simulate_cell_update() -> Duration {
+fn simulate_cell_update() -> Duration {
         // This simulates:
         // - Writing command to unified memory
         // - GPU kernel processing
@@ -159,13 +143,18 @@ mod latency_tests {
 
         // Simulate various latency scenarios
         let base_latency = 2.0;  // microseconds
-        let jitter = (rand::random::<f64>() - 0.5) * 3.0;  // ±1.5 µs jitter
+        // Simple deterministic jitter using system time nanos as pseudo-random source
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
+        let jitter = ((nanos % 300) as f64 / 100.0) - 1.5;  // ±1.5 µs jitter
         let total = base_latency + jitter;
 
         Duration::from_secs_f64(total.max(0.0) / 1_000_000.0)
     }
 
-    fn analyze_latencies(latencies: &[f64]) -> LatencyResult {
+fn analyze_latencies(latencies: &[f64]) -> LatencyResult {
         let mut sorted = latencies.to_vec();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
@@ -209,7 +198,7 @@ mod latency_tests {
         }
     }
 
-    fn print_latency_results(result: &LatencyResult) {
+fn print_latency_results(result: &LatencyResult) {
         println!("\n=== Latency Analysis ({:?} samples) ===", result.total_samples);
         println!("┌────────────────────────────────────────────────┐");
         println!("│  Metric          │  Value          │  Target   │");
@@ -251,9 +240,8 @@ mod latency_tests {
             println!("   ⚠️  Average latency above target");
         }
     }
-}
 
-// Optimization recommendations based on test results
+#[allow(dead_code)]
 fn generate_optimization_recommendations(result: &LatencyResult) -> Vec<String> {
     let mut recommendations = Vec::new();
 
@@ -270,7 +258,7 @@ fn generate_optimization_recommendations(result: &LatencyResult) -> Vec<String> 
         );
     }
 
-    if result.below_target as f64 / result.total_samples as f64 < 0.5 {
+    if (result.below_target as f64 / result.total_samples as f64) < 0.5 {
         recommendations.push(
             "Less than 50% of samples meet target. Consider optimizing the critical path.".to_string()
         );
@@ -299,52 +287,35 @@ fn generate_optimization_recommendations(result: &LatencyResult) -> Vec<String> 
     recommendations
 }
 
-#[cfg(test)]
-mod optimization_tests {
-    use super::*;
+#[test]
+fn test_optimization_polling_strategies() {
+    println!("\n=== Polling Strategy Comparison ===");
 
-    #[test]
-    fn test_polling_strategies() {
-        println!("\n=== Polling Strategy Comparison ===");
+    let strategies = vec![
+        ("Spin-wait (0 ns)", 0),
+        ("Micro-sleep (100 ns)", 100),
+        ("Yield (1000 ns)", 1000),
+    ];
 
-        // Compare different polling strategies
-        let strategies = vec![
-            ("Spin-wait (0 ns)", 0),
-            ("Micro-sleep (100 ns)", 100),
-            ("Yield (1000 ns)", 1000),
-        ];
-
-        for (name, interval_ns) in strategies {
-            println!("\nStrategy: {}", name);
-            // Measure latency and power consumption for each strategy
-        }
-    }
-
-    #[test]
-    fn test_memory_coalescing_impact() {
-        println!("\n=== Memory Coalescing Impact ===");
-
-        // Test with different memory access patterns
-        // Measure impact on latency
-    }
-
-    #[test]
-    fn test_warp_contention() {
-        println!("\n=== Warp Contention Analysis ===");
-
-        // Test with different numbers of concurrent warps
-        // Measure impact on latency
+    for (name, interval_ns) in strategies {
+        let _ = interval_ns;
+        println!("\nStrategy: {}", name);
     }
 }
 
-// Benchmark utilities
-#[cfg(test)]
-mod benchmarks {
-    use super::*;
+#[test]
+fn test_memory_coalescing_impact() {
+    println!("\n=== Memory Coalescing Impact ===");
+}
 
-    #[test]
-    #[ignore]  // Run manually with --ignored
-    fn benchmark_sustained_throughput() {
+#[test]
+fn test_warp_contention() {
+    println!("\n=== Warp Contention Analysis ===");
+}
+
+#[test]
+#[ignore]  // Run manually with --ignored
+fn benchmark_sustained_throughput() {
         println!("\n=== Sustained Throughput Benchmark ===");
         println!("Running for 10 seconds...\n");
 
@@ -356,19 +327,18 @@ mod benchmarks {
         while start.elapsed() < duration {
             let op_start = Instant::now();
             // Perform cell update
-            let _ = simulate_cell_update();
-            total_latency += op_start.elapsed().as_secs_f64() * 1_000_000.0;
-            operations += 1;
+        let _ = simulate_cell_update();
+        total_latency += op_start.elapsed().as_secs_f64() * 1_000_000.0;
+        operations += 1;
 
-            if operations % 1000 == 0 {
-                print!("\r  Operations: {} | Avg latency: {:.2} µs",
-                    operations, total_latency / operations as f64);
-                use std::io::Write;
-                std::io::stdout().flush().unwrap();
-            }
+        if operations % 1000 == 0 {
+            print!("\r  Operations: {} | Avg latency: {:.2} µs",
+                operations, total_latency / operations as f64);
+            use std::io::Write;
+            std::io::stdout().flush().unwrap();
         }
-
-        println!("\n\nThroughput: {} ops/sec", operations as f64 / duration.as_secs_f64());
-        println!("Average latency: {:.2} µs", total_latency / operations as f64);
     }
+
+    println!("\n\nThroughput: {} ops/sec", operations as f64 / duration.as_secs_f64());
+    println!("Average latency: {:.2} µs", total_latency / operations as f64);
 }
