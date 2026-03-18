@@ -1236,10 +1236,26 @@ impl LockFreeDispatcher {
             let head_mut_ptr = &mut (*self.queue_ptr).head as *mut u32;
             std::ptr::write_volatile(head_mut_ptr, claimed_head.wrapping_add(1));
 
-            // Bump commands_sent counter atomically (safe for multi-producer).
-            let sent_ptr = &mut (*self.queue_ptr).commands_sent as *mut u64;
-            let current_sent = std::ptr::read_volatile(sent_ptr);
-            std::ptr::write_volatile(sent_ptr, current_sent.wrapping_add(1));
+            // Bump commands_sent counter.
+            // SAFETY: This runs while we still hold the ticket-lock (head ==
+            // claimed_head + 1), so the NEXT producer's ticket-lock spin on
+            // head hasn't resolved yet.  However, a *prior* producer could
+            // still be executing this line concurrently (it already published
+            // its head).  Use a true atomic add to avoid the read-modify-write
+            // race described in review comment BUG_0001.
+            let sent_ptr = &(*self.queue_ptr).commands_sent as *const u64 as *mut u64;
+            #[cfg(target_has_atomic = "64")]
+            {
+                let sent_atomic = &*(sent_ptr as *const std::sync::atomic::AtomicU64);
+                sent_atomic.fetch_add(1, Ordering::Relaxed);
+            }
+            #[cfg(not(target_has_atomic = "64"))]
+            {
+                // Fallback for platforms without 64-bit atomics (unlikely on
+                // x86_64 / aarch64, but keeps the build green everywhere).
+                let current_sent = std::ptr::read_volatile(sent_ptr);
+                std::ptr::write_volatile(sent_ptr, current_sent.wrapping_add(1));
+            }
         }
 
         // ── 5. Record latency stats (Relaxed — off the hot path) ──

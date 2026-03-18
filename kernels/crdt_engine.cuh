@@ -3650,6 +3650,13 @@ __device__ __forceinline__ void ptx_membar_gpu() {
  * CAS succeeds, we update the remaining fields with a second
  * CAS on the timestamp+node_id+state packed as 64 bits.
  *
+ * IMPORTANT: Two sequential CAS ops are NOT jointly atomic. If the
+ * value CAS succeeds but the timestamp CAS fails, we must roll back
+ * the value field. If the rollback CAS itself fails (because a
+ * concurrent thread overwrote the value in between), we retry the
+ * entire two-phase operation from scratch to avoid leaving the cell
+ * in an inconsistent state (new value + old timestamp).
+ *
  * @param cell_ptr  Pointer to the CRDTCell in global memory
  * @param expected  Expected current cell state
  * @param desired   Desired new cell state
@@ -3670,31 +3677,49 @@ __device__ __forceinline__ bool ptx_cas_crdt_cell(
     const unsigned long long* exp64 = reinterpret_cast<const unsigned long long*>(expected);
     const unsigned long long* des64 = reinterpret_cast<const unsigned long long*>(desired);
 
-    // CAS on value (bytes 0-7)
-    unsigned long long old_val = ptx_atom_cas_b64(&ptr64[0], exp64[0], des64[0]);
-    if (old_val != exp64[0]) {
-        return false;  // Value changed since we read it
+    const int MAX_RETRIES = 4;  // Cap retries to avoid livelock
+
+    for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
+        // CAS on value (bytes 0-7)
+        unsigned long long old_val = ptx_atom_cas_b64(&ptr64[0], exp64[0], des64[0]);
+        if (old_val != exp64[0]) {
+            return false;  // Value changed since we read it — caller should re-read
+        }
+
+        // CAS on timestamp (bytes 8-15)
+        unsigned long long old_ts = ptx_atom_cas_b64(&ptr64[1], exp64[1], des64[1]);
+        if (old_ts != exp64[1]) {
+            // Timestamp was modified concurrently. Roll back the value field.
+            unsigned long long rollback = ptx_atom_cas_b64(&ptr64[0], des64[0], exp64[0]);
+            if (rollback == des64[0]) {
+                // Rollback succeeded — cell is back to consistent state.
+                return false;
+            }
+            // Rollback failed: a concurrent thread already overwrote our value.
+            // The cell now has (concurrent_value, concurrent_timestamp) which may
+            // or may not be consistent depending on what that thread did. Our
+            // desired write was effectively superseded. Retry from scratch in case
+            // the cell has settled back to expected state.
+            if (attempt < MAX_RETRIES - 1) {
+                ptx_nanosleep(100 * (1U << attempt));  // Brief backoff
+                continue;  // Retry the two-phase CAS
+            }
+            return false;  // Exhausted retries — let caller handle
+        }
+
+        // Both CAS ops succeeded — update node_id + state
+        unsigned int* ptr32 = reinterpret_cast<unsigned int*>(cell_ptr);
+        const unsigned int* des32 = reinterpret_cast<const unsigned int*>(desired);
+        ptr32[4] = des32[4];  // node_id
+        ptr32[5] = des32[5];  // state
+
+        // GPU-scope fence to publish the complete cell update
+        ptx_membar_gpu();
+
+        return true;
     }
 
-    // CAS on timestamp (bytes 8-15)
-    unsigned long long old_ts = ptx_atom_cas_b64(&ptr64[1], exp64[1], des64[1]);
-    if (old_ts != exp64[1]) {
-        // Rollback value field
-        ptx_atom_cas_b64(&ptr64[0], des64[0], exp64[0]);
-        return false;
-    }
-
-    // Non-atomic store for node_id + state (bytes 16-23)
-    // Safe because we "own" the cell after two successful CAS ops
-    unsigned int* ptr32 = reinterpret_cast<unsigned int*>(cell_ptr);
-    const unsigned int* des32 = reinterpret_cast<const unsigned int*>(desired);
-    ptr32[4] = des32[4];  // node_id
-    ptr32[5] = des32[5];  // state
-
-    // GPU-scope fence to publish the complete cell update
-    ptx_membar_gpu();
-
-    return true;
+    return false;  // Should not reach here
 }
 
 /**
@@ -4543,6 +4568,11 @@ __global__ void parallel_formula_recalc_kernel(
     uint32_t node_id,
     uint32_t* stats_out
 ) {
+    // Defense-in-depth: block size MUST be a multiple of 32 to avoid
+    // partial-warp UB in __shfl_up_sync / __ballot_sync and to ensure
+    // block_prefix_sum_exclusive writes smem[warp_id] from lane 31.
+    assert(blockDim.x % 32 == 0 && "parallel_formula_recalc_kernel: blockDim.x must be a multiple of 32");
+
     // Shared memory for recalculation state
     extern __shared__ char smem_raw[];
     ParallelRecalcState* state = reinterpret_cast<ParallelRecalcState*>(smem_raw);
@@ -4676,6 +4706,10 @@ __global__ void evaluate_frontier_kernel(
     uint32_t node_id,
     uint32_t* success_out
 ) {
+    // Defense-in-depth: block size must be a multiple of 32 so that
+    // __ballot_sync(WARP_MASK, ...) operates on full warps only.
+    assert(blockDim.x % 32 == 0 && "evaluate_frontier_kernel: blockDim.x must be a multiple of 32");
+
     const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     bool ok = false;
 
@@ -4788,6 +4822,10 @@ __global__ void compact_ready_cells_kernel(
     uint32_t* frontier_out,
     uint32_t* frontier_count
 ) {
+    // Defense-in-depth: block size must be a multiple of 32 for
+    // block_prefix_sum_exclusive correctness (see launch doc above).
+    assert(blockDim.x % 32 == 0 && "compact_ready_cells_kernel: blockDim.x must be a multiple of 32");
+
     __shared__ uint32_t smem[33];  // For block_prefix_sum_exclusive
     const uint32_t tid = threadIdx.x;
 
