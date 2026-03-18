@@ -60,6 +60,11 @@ pub struct MuscleFiberCompilation {
 
     /// Total wall-clock time for generation + compilation (microseconds).
     pub total_time_us: u64,
+
+    /// The primary kernel entry point name in the compiled PTX.
+    /// Used to validate that the PTX contains the expected symbol
+    /// before binding it to a specific fiber task.
+    pub entry_point: String,
 }
 
 // ============================================================
@@ -136,6 +141,10 @@ impl MuscleFiberCompiler {
             target_arch: arch,
             simulated,
             total_time_us,
+            // The generated kernel always uses this entry point name.
+            // Callers must verify this matches the fiber's expected symbol
+            // before storing the PTX in DnaKernelSource::Ptx.
+            entry_point: "persistent_worker_muscle".to_string(),
         })
     }
 
@@ -557,7 +566,10 @@ extern "C" __global__ void formula_recalc_muscle(
 
     // Load frontier cells into shared memory
     #pragma unroll CUDACLAW_UNROLL_FACTOR
-    for (int i = threadIdx.x; i < CUDACLAW_FRONTIER_BATCH && i < frontier_size;
+    for (int i = threadIdx.x;
+         i < CUDACLAW_FRONTIER_BATCH &&
+         i < frontier_size &&
+         i < (CUDACLAW_SHARED_MEM_BYTES / sizeof(float));
          i += CUDACLAW_BLOCK_SIZE) {{
         int cell_idx = frontier[i];
         if (cell_idx < total_cells) {{

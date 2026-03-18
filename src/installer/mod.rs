@@ -484,13 +484,26 @@ impl Installer {
         // existing kernel sources.
         if let Some(compilation) = nvrtc_compilation {
             if !compilation.simulated {
-                // Store compiled PTX using the Ptx variant so runtime.rs loads it
-                // directly without attempting to re-compile it via NVRTC.
-                if let Some(fiber) = dna.muscle_fibers.get_mut("cell_update") {
-                    fiber.kernel_source = crate::dna::DnaKernelSource::Ptx {
-                        ptx: compilation.compilation.ptx.clone(),
-                        target_arch: compilation.target_arch.replace("compute_", "sm_"),
-                    };
+                // Only store PTX when the compiled entry point matches the
+                // fiber's expected kernel symbol. The generated muscle kernel
+                // uses "persistent_worker_muscle" — the cell_update fiber
+                // expects this exact entry. If the names diverge (e.g., a
+                // future refactor renames the entry), we skip the update and
+                // record a note rather than binding an incompatible PTX blob.
+                const CELL_UPDATE_ENTRY: &str = "persistent_worker_muscle";
+                if compilation.entry_point == CELL_UPDATE_ENTRY {
+                    if let Some(fiber) = dna.muscle_fibers.get_mut("cell_update") {
+                        fiber.kernel_source = crate::dna::DnaKernelSource::Ptx {
+                            ptx: compilation.compilation.ptx.clone(),
+                            target_arch: compilation.target_arch.replace("compute_", "sm_"),
+                        };
+                    }
+                } else {
+                    println!(
+                        "    [DNA] Skipping PTX storage: entry '{}' does not match \
+                         expected '{}' for cell_update fiber",
+                        compilation.entry_point, CELL_UPDATE_ENTRY
+                    );
                 }
             }
         }
