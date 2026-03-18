@@ -482,9 +482,15 @@ extern "C" __global__ void persistent_worker(CommandQueue* queue, CRDTState* crd
                 if (crdt) {
                     writes = smartcrdt_edit_cell(crdt, cell_id, value,
                                                  cmd_ts, node_id, lane_id);
-                    // After writing, trigger warp-parallel formula recalc
-                    // for the dependency neighborhood of the edited cell.
-                    smartcrdt_trigger_recalc(crdt, cell_id, cmd_ts, node_id);
+                    // NOTE: smartcrdt_trigger_recalc is intentionally NOT
+                    // called here. The current warp_recalculate_cells()
+                    // in crdt_engine.cuh is a placeholder that increments
+                    // cell values by +1.0 with timestamp+1, which always
+                    // wins LWW resolution and silently corrupts every
+                    // just-written value. Re-enable this call once a real
+                    // formula recalculation engine is implemented:
+                    //
+                    // smartcrdt_trigger_recalc(crdt, cell_id, cmd_ts, node_id);
                 } else {
                     // CPU-only / test mode: log without CRDT
                     if (lane_id == 0) {
