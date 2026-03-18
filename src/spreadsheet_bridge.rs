@@ -455,28 +455,27 @@ impl SpreadsheetBridge {
                 .push(key.clone());
         }
 
-        // Update root metadata.
-        if let Some(root) = self.roots.get_mut(&key) {
-            let change = FormulaChange {
-                row,
-                col,
-                old_formula: old_formula.clone(),
-                new_formula: formula.to_string(),
-                new_dependency_count: deps.len() as u32,
-                timestamp: now_epoch_ms(),
-            };
+        // Compute values that need &self BEFORE taking &mut self.roots.
+        let rev_count = self.reverse_deps.get(&key).map(|v| v.len()).unwrap_or(0) as u32;
+        let pattern = self.classify_pattern(row, col);
+        let chain_len = self.compute_dependency_chain_length(row, col);
+        let spawn_params = self.compute_spawn_params(chain_len);
+        let fiber_cooldown = self.config.fiber_cooldown_ms;
+        let ramification_threshold = self.config.ramification_threshold;
 
+        // Update root's pattern FIRST so assess_fiber_efficiency sees the new pattern.
+        if let Some(root) = self.roots.get_mut(&key) {
+            root.detected_pattern = pattern;
+        }
+
+        // Now assess efficiency with the updated pattern.
+        let assessment = self.assess_fiber_efficiency(row, col);
+
+        // Now take the mutable borrow on roots for remaining updates.
+        if let Some(root) = self.roots.get_mut(&key) {
             root.formula = formula.to_string();
             root.dependency_count = deps.len() as u32;
-
-            // Count downstream dependents.
-            let rev_count = self.reverse_deps.get(&key).map(|v| v.len()).unwrap_or(0);
-            root.dependent_count = rev_count as u32;
-
-            // Harvest: detect the new pattern.
-            let pattern = self.classify_pattern(row, col);
-            let old_pattern = root.detected_pattern;
-            root.detected_pattern = pattern;
+            root.dependent_count = rev_count;
 
             // Emit FormulaHarvested event.
             self.pending_events.push(RamificationEvent::FormulaHarvested {
@@ -488,13 +487,12 @@ impl SpreadsheetBridge {
             });
 
             // Check fiber efficiency.
-            let assessment = self.assess_fiber_efficiency(row, col);
             root.fiber_efficiency = assessment.current_efficiency;
 
             if assessment.should_switch {
                 let now = now_epoch_ms();
                 let since_last = now.saturating_sub(root.last_fiber_change_epoch);
-                if since_last >= self.config.fiber_cooldown_ms {
+                if since_last >= fiber_cooldown {
                     let old_fiber = root.current_fiber.clone();
                     root.current_fiber = assessment.recommended_fiber.clone();
                     root.last_fiber_change_epoch = now;
@@ -516,9 +514,8 @@ impl SpreadsheetBridge {
 
             // Check if Ramification is needed.
             if pattern.needs_ramification() {
-                let chain_len = self.compute_dependency_chain_length(row, col);
-                if chain_len >= self.config.ramification_threshold {
-                    let (threads, block_size) = self.compute_spawn_params(chain_len);
+                if chain_len >= ramification_threshold {
+                    let (threads, block_size) = spawn_params;
                     root.ramification_active = true;
 
                     self.pending_events.push(RamificationEvent::SpawnRecalcThreads {

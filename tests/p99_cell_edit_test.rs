@@ -97,13 +97,13 @@ fn push_command(queue: &mut CommandQueueHost, cmd: Command) -> bool {
         let index = (head % QUEUE_SIZE) as usize;
         queue.buffer[index] = cmd;
         std::sync::atomic::fence(Ordering::SeqCst);
-        let atomic = &*((&queue.head as *const u32) as *const AtomicU32);
+        let atomic = &*((std::ptr::addr_of!(queue.head)) as *const AtomicU32);
         if atomic
             .compare_exchange_weak(head, next_head, Ordering::SeqCst, Ordering::Relaxed)
             .is_ok()
         {
             let pushed_atomic =
-                &*((&queue.commands_sent as *const u64) as *const AtomicU64);
+                &*((std::ptr::addr_of!(queue.commands_sent)) as *const AtomicU64);
             pushed_atomic.fetch_add(1, Ordering::SeqCst);
             if queue.status == QueueStatus::StatusIdle as u32 {
                 queue.status = QueueStatus::StatusReady as u32;

@@ -9,10 +9,12 @@
 // - Backpressure management
 // - Async/await support for non-blocking operations
 
+#[cfg(feature = "cuda")]
 use cust::memory::UnifiedBuffer;
 use crate::cuda_claw::{Command, CommandQueueHost, CommandType, QueueStatus};
 use std::sync::{Arc, Mutex, atomic::{AtomicU64, AtomicU32, Ordering}};
 use std::time::{Duration, Instant};
+#[cfg(feature = "cuda")]
 use std::collections::VecDeque;
 
 // ============================================================
@@ -71,6 +73,7 @@ pub struct DispatchResult {
 }
 
 /// Pending command awaiting completion
+#[cfg(feature = "cuda")]
 struct PendingCommand {
     command: Command,
     submit_time: Instant,
@@ -124,6 +127,7 @@ struct PendingCommand {
 /// │                                                               │
 /// └─────────────────────────────────────────────────────────────┘
 /// ```
+#[cfg(feature = "cuda")]
 pub struct GpuDispatcher {
     /// Unified memory command queue (shared with GPU)
     queue: Arc<Mutex<UnifiedBuffer<CommandQueueHost>>>,
@@ -148,6 +152,7 @@ pub struct GpuDispatcher {
     batch_size: usize,
 }
 
+#[cfg(feature = "cuda")]
 impl GpuDispatcher {
     /// Create a new GPU dispatcher
     ///
@@ -588,10 +593,12 @@ impl GpuDispatcher {
 ///     Ok(())
 /// }
 /// ```
+#[cfg(feature = "cuda")]
 pub struct AsyncGpuDispatcher {
     inner: Arc<Mutex<GpuDispatcher>>,
 }
 
+#[cfg(feature = "cuda")]
 impl AsyncGpuDispatcher {
     /// Create a new async GPU dispatcher
     pub fn new(
@@ -725,7 +732,7 @@ pub fn calculate_batch_stats(results: &[DispatchResult]) -> (f64, f64, f64) {
 /// let dispatcher = SpinLockDispatcher::new(queue_ptr)?;
 ///
 /// // Dispatch NOOP command
-/// let cmd = Command::new(CommandType::Noop, 0);
+/// let cmd = Command::new(CommandType::NoOp, 0);
 /// let (cmd_id, latency_ns) = dispatcher.dispatch_atomic(cmd)?;
 ///
 /// println!("Dispatched command {} in {} ns", cmd_id, latency_ns);
@@ -818,7 +825,7 @@ impl SpinLockDispatcher {
     ///
     /// # Example
     /// ```rust
-    /// let cmd = Command::new(CommandType::Noop, 0);
+    /// let cmd = Command::new(CommandType::NoOp, 0);
     /// let (cmd_id, latency_ns) = dispatcher.dispatch_atomic(cmd)?;
     /// assert!(latency_ns < 1000, "Dispatch should be < 1µs");
     /// ```
@@ -931,9 +938,9 @@ impl SpinLockDispatcher {
     /// # Example
     /// ```rust
     /// let commands = vec![
-    ///     Command::new(CommandType::Noop, 0),
-    ///     Command::new(CommandType::Noop, 1),
-    ///     Command::new(CommandType::Noop, 2),
+    ///     Command::new(CommandType::NoOp, 0),
+    ///     Command::new(CommandType::NoOp, 1),
+    ///     Command::new(CommandType::NoOp, 2),
     /// ];
     /// let results = dispatcher.dispatch_batch_atomic(commands)?;
     /// ```
@@ -1243,7 +1250,7 @@ impl LockFreeDispatcher {
             // still be executing this line concurrently (it already published
             // its head).  Use a true atomic add to avoid the read-modify-write
             // race described in review comment BUG_0001.
-            let sent_ptr = &(*self.queue_ptr).commands_sent as *const u64 as *mut u64;
+            let sent_ptr = std::ptr::addr_of!((*self.queue_ptr).commands_sent) as *mut u64;
             #[cfg(target_has_atomic = "64")]
             {
                 let sent_atomic = &*(sent_ptr as *const std::sync::atomic::AtomicU64);
@@ -1407,7 +1414,7 @@ impl Default for BenchmarkConfig {
             num_commands: 10_000,
             warmup_iterations: 1_000,
             target_latency_ns: 5_000, // 5 microseconds
-            command_type: CommandType::Noop,
+            command_type: CommandType::NoOp,
             detailed_stats: true,
         }
     }
@@ -1650,13 +1657,13 @@ impl SpinLockDispatcher {
 
 /// Create a NOOP command for benchmarking
 pub fn create_noop_command(id: u32) -> Command {
-    Command::new(CommandType::Noop, id)
+    Command::new(CommandType::NoOp, id)
 }
 
 /// Create a batch of NOOP commands
 pub fn create_noop_batch(count: u64) -> Vec<Command> {
     (0..count)
-        .map(|i| Command::new(CommandType::Noop, i as u32))
+        .map(|i| Command::new(CommandType::NoOp, i as u32))
         .collect()
 }
 
@@ -1669,6 +1676,7 @@ mod tests {
     use super::*;
     use crate::cuda_claw::CommandQueueHost;
 
+    #[cfg(feature = "cuda")]
     #[test]
     fn test_dispatcher_creation() {
         let queue_data = CommandQueueHost::default();
@@ -1732,13 +1740,13 @@ mod tests {
         let config = BenchmarkConfig::default();
         assert_eq!(config.num_commands, 10_000);
         assert_eq!(config.target_latency_ns, 5_000);
-        assert_eq!(config.command_type, CommandType::Noop);
+        assert_eq!(config.command_type, CommandType::NoOp);
     }
 
     #[test]
     fn test_create_noop_command() {
         let cmd = create_noop_command(42);
-        assert_eq!(cmd.cmd_type, CommandType::Noop as u32);
+        assert_eq!(cmd.cmd_type, CommandType::NoOp as u32);
         assert_eq!(cmd.id, 42);
     }
 
@@ -1781,7 +1789,7 @@ mod tests {
         let (_queue, ptr) = alloc_test_queue();
         let dispatcher = LockFreeDispatcher::new(ptr).unwrap();
 
-        let cmd = Command::new(CommandType::Noop, 0);
+        let cmd = Command::new(CommandType::NoOp, 0);
         let result = dispatcher.push(cmd);
         assert!(result.is_ok());
 
@@ -1801,7 +1809,7 @@ mod tests {
         let dispatcher = LockFreeDispatcher::new(ptr).unwrap();
 
         let commands: Vec<Command> = (0..10)
-            .map(|i| Command::new(CommandType::Noop, i))
+            .map(|i| Command::new(CommandType::NoOp, i))
             .collect();
         let results = dispatcher.push_batch(commands);
         assert!(results.is_ok());
@@ -1838,7 +1846,7 @@ mod tests {
 
         // Push some commands
         for _ in 0..5 {
-            let cmd = Command::new(CommandType::Noop, 0);
+            let cmd = Command::new(CommandType::NoOp, 0);
             dispatcher.push(cmd).unwrap();
         }
         assert_eq!(dispatcher.get_stats().commands_dispatched, 5);
@@ -1860,7 +1868,7 @@ mod tests {
 
         // Push 3 commands and verify head in unified memory
         for _ in 0..3 {
-            let cmd = Command::new(CommandType::Noop, 0);
+            let cmd = Command::new(CommandType::NoOp, 0);
             dispatcher.push(cmd).unwrap();
         }
 
@@ -1881,7 +1889,7 @@ mod tests {
         let dispatcher = LockFreeDispatcher::new(ptr).unwrap();
 
         for i in 0..100 {
-            let cmd = Command::new(CommandType::Noop, i);
+            let cmd = Command::new(CommandType::NoOp, i);
             assert!(dispatcher.push(cmd).is_ok());
         }
     }

@@ -1,4 +1,6 @@
-use cuda_claw::{CudaClawExecutor, CommandQueueHost, Command, CommandType};
+use cuda_claw::{CommandQueueHost, Command, CommandType};
+#[cfg(feature = "cuda")]
+use cuda_claw::CudaClawExecutor;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -17,8 +19,11 @@ mod colors {
     pub const BRIGHT_BLUE: &str = "\x1b[94m";
 }
 
+#[cfg(feature = "cuda")]
 mod agent;
+#[cfg(feature = "cuda")]
 mod alignment;
+#[cfg(feature = "cuda")]
 mod bridge;
 mod constraint_theory;
 mod cuda_claw;
@@ -34,17 +39,25 @@ mod ramify_monitor;
 mod runtime;
 mod spreadsheet_bridge;
 mod monitor;
+#[cfg(feature = "cuda")]
 mod volatile_dispatcher;
 
+#[cfg(feature = "cuda")]
 use agent::{AgentDispatcher, AgentOperation, AgentType, CellRef, SuperInstance};
+#[cfg(feature = "cuda")]
 use alignment::{assert_alignment, verify_alignment, KernelConfig, KernelLifecycleManager, print_alignment_report};
+#[cfg(feature = "cuda")]
 use bridge::{GpuBridge, allocate_command_queue};
-use dispatcher::{GpuDispatcher, create_add_command, create_add_batch, calculate_batch_stats, SpinLockDispatcher, BenchmarkConfig, create_noop_command, create_noop_batch};
+#[cfg(feature = "cuda")]
+use dispatcher::{GpuDispatcher, create_add_command, create_add_batch, calculate_batch_stats};
+use dispatcher::{SpinLockDispatcher, BenchmarkConfig, create_noop_command, create_noop_batch};
 use gpu_metrics::{GpuMetricsCollector, HighResolutionTimer, LatencyStats};
 use lock_free_queue::LockFreeCommandQueue;
 use monitor::{SuperInstanceMonitor, quick_demo};
+#[cfg(feature = "cuda")]
 use volatile_dispatcher::{VolatileDispatcher, RoundTripBenchmark};
 
+#[cfg(feature = "cuda")]
 fn run_persistent_worker_demo() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n=== Persistent Worker Kernel Demo ===");
     println!("Demonstrating warp-level parallelism in persistent GPU kernel...\n");
@@ -184,6 +197,7 @@ fn run_persistent_worker_demo() -> Result<(), Box<dyn std::error::Error>> {
 //
 // ============================================================
 
+#[cfg(feature = "cuda")]
 fn run_alignment_verification() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n=== Memory Alignment Verification ===");
     println!("Verifying #[repr(C)] alignment between Rust and CUDA...\n");
@@ -203,6 +217,7 @@ fn run_alignment_verification() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[cfg(feature = "cuda")]
 fn run_long_running_kernel_demo(
     command_queue: Arc<Mutex<cust::memory::UnifiedBuffer<cuda_claw::CommandQueueHost>>>
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -254,6 +269,7 @@ fn run_long_running_kernel_demo(
 //
 // ============================================================
 
+#[cfg(feature = "cuda")]
 fn run_gpu_dispatcher_demo(
     command_queue: Arc<Mutex<cust::memory::UnifiedBuffer<cuda_claw::CommandQueueHost>>>
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -345,6 +361,7 @@ fn run_gpu_dispatcher_demo(
 // Lock-Free CommandQueue Demonstration
 // ============================================================
 
+#[cfg(feature = "cuda")]
 fn run_lock_free_queue_demo() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n=== Lock-Free CommandQueue Demo ===");
     println!("Demonstrating lock-free producer-consumer queue in unified memory...\n");
@@ -668,6 +685,7 @@ fn run_lock_free_queue_demo() -> Result<(), Box<dyn std::error::Error>> {
 /// ), Box<dyn std::error::Error>> {
 ///     // ... using GpuBridge abstraction ...
 /// }
+#[cfg(feature = "cuda")]
 fn init_gpu_bridge() -> Result<(
     GpuBridge<cuda_claw::CommandQueueHost>,
     *mut cuda_claw::CommandQueueHost
@@ -695,6 +713,7 @@ fn init_gpu_bridge() -> Result<(
 }
 
 /// Demonstrate GpuBridge API usage
+#[cfg(feature = "cuda")]
 fn run_gpu_bridge_demo() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n=== GPU Bridge (Unified Memory Allocator) Demo ===");
     println!("Demonstrating dedicated Unified Memory allocator...\n");
@@ -756,6 +775,7 @@ fn run_gpu_bridge_demo() -> Result<(), Box<dyn std::error::Error>> {
 // ROUND-TRIP LATENCY BENCHMARK
 // ============================================================
 
+#[cfg(feature = "cuda")]
 fn run_round_trip_benchmark() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n=== Round-Trip Latency Benchmark ===");
     println!("Measuring Rust→GPU→Rust command round-trip latency\n");
@@ -808,6 +828,7 @@ fn run_round_trip_benchmark() -> Result<(), Box<dyn std::error::Error>> {
 // PERSISTENT KERNEL WITH NON-BLOCKING COMMAND SUBMISSION
 // ============================================================
 
+#[cfg(feature = "cuda")]
 fn run_persistent_kernel_demo() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n=== Persistent Kernel Demo (Non-Blocking) ===");
     println!("Demonstrating persistent GPU kernel with ultra-low latency command submission\n");
@@ -1307,77 +1328,71 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    println!("CudaClaw - GPU-Accelerated SmartCRDT Orchestrator");
-    println!("==============================================\n");
-
-    // Initialize CUDA
-    let _ctx = cust::quick_init().expect("Failed to initialize CUDA");
-
-    println!("CUDA initialized successfully");
-    // println!("GPUs available: {}", cust::device::get_count()?);  // TODO: cust 0.3 API different
-
-    // Verify alignment before proceeding
-    run_alignment_verification()?;
+    // ============================================================
+    // CLI: Check for "benchmark" subcommand (no CUDA required)
+    // ============================================================
+    if args.first().map(|s| s.as_str()) == Some("benchmark") {
+        run_p99_cell_edit_benchmark()?;
+        return Ok(());
+    }
 
     // ============================================================
-    // DEMO 1: Spin-Lock Dispatcher Benchmark
+    // CUDA-dependent section
     // ============================================================
-    // This demonstrates ultra-low latency dispatch with atomic operations:
-    // - Lock-free atomic writes to head index
-    // - 10,000 NOOP commands benchmark
-    // - Target: < 5 microseconds dispatch-to-execution time
-    // - Sub-microsecond dispatch latency
+    #[cfg(feature = "cuda")]
+    {
+        println!("CudaClaw - GPU-Accelerated SmartCRDT Orchestrator");
+        println!("==============================================\n");
 
-    run_spinlock_benchmark()?;
+        // Initialize CUDA
+        let _ctx = cust::quick_init().expect("Failed to initialize CUDA");
 
-    // ============================================================
-    // DEMO 2: SuperInstance Monitor (NEW!)
-    // ============================================================
-    // This demonstrates real-time visualization of the Unified Memory buffer:
-    // - Live heat map of spreadsheet grid
-    // - Real-time queue statistics
-    // - Zero-copy reads (no GPU interruption)
-    // - 100ms update interval
+        println!("CUDA initialized successfully");
 
-    println!("\n{}Launching SuperInstance Monitor demo...{}", colors::CYAN, colors::RESET);
-    std::thread::sleep(Duration::from_secs(2));
+        // Verify alignment before proceeding
+        run_alignment_verification()?;
 
-    // Initialize executor for monitor demo
-    let mut executor = CudaClawExecutor::new()?;
-    executor.init_queue()?;
-    executor.start()?;
+        // DEMO 1: Spin-Lock Dispatcher Benchmark
+        run_spinlock_benchmark()?;
 
-    // Run monitor demo with 100x100 grid, 100ms updates
-    run_monitor_demo(executor.queue.clone(), 100, 100, Duration::from_millis(100))?;
+        // DEMO 2: SuperInstance Monitor
+        println!("\n{}Launching SuperInstance Monitor demo...{}", colors::CYAN, colors::RESET);
+        std::thread::sleep(Duration::from_secs(2));
 
-    executor.shutdown()?;
+        let mut executor = CudaClawExecutor::new()?;
+        executor.init_queue()?;
+        executor.start()?;
 
-    // ============================================================
-    // DEMO 3: P99 Cell-Edit Latency Benchmark + GPU Metrics
-    // ============================================================
-    // Pushes 1,000,000 random cell edits through the CommandQueue,
-    // calculates P99 latency, logs GPU thermal/occupancy metrics,
-    // and writes latency_report.json.
+        run_monitor_demo(executor.queue.clone(), 100, 100, Duration::from_millis(100))?;
 
-    run_p99_cell_edit_benchmark()?;
+        executor.shutdown()?;
 
-    // ============================================================
-    // Additional demos (commented out for clarity)
-    // ============================================================
-    // Uncomment to run additional demonstrations:
+        // DEMO 3: P99 Cell-Edit Latency Benchmark + GPU Metrics
+        run_p99_cell_edit_benchmark()?;
+    }
 
-    // DEMO 4: Persistent Kernel with Non-Blocking Command Submission
-    // run_persistent_kernel_demo()?;
-
-    // Demonstrate GPU Bridge (Unified Memory Allocator)
-    // run_gpu_bridge_demo()?;
-
-    // Run round-trip latency benchmark with volatile dispatcher
-    // run_round_trip_benchmark()?;
+    #[cfg(not(feature = "cuda"))]
+    {
+        println!("CudaClaw - GPU-Accelerated SmartCRDT Orchestrator");
+        println!("==============================================\n");
+        println!("Running without CUDA support. Available subcommands:");
+        println!("  benchmark   - P99 cell-edit latency benchmark (no GPU required)");
+        println!("  dna         - RamifiedRole DNA manager");
+        println!("  constraint  - Constraint-Theory DNA");
+        println!("  agent       - GPU cell agent manager");
+        println!("  feedback    - ML feedback loop");
+        println!("  ramify      - Ramify engine");
+        println!("  runtime     - Ramify runtime");
+        println!("  spreadsheet - Spreadsheet bridge");
+        println!("  install     - Intelligent installer");
+        println!("  monitor-tree - Ramify monitor dashboard");
+        println!("\nTo enable CUDA features, build with: cargo build --features cuda");
+    }
 
     Ok(())
 }
 
+#[cfg(feature = "cuda")]
 fn run_latency_tests(executor: &mut CudaClawExecutor) -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Latency Tests ===");
     println!("Testing round-trip latency between host and GPU kernel...\n");
@@ -1421,6 +1436,7 @@ fn run_latency_tests(executor: &mut CudaClawExecutor) -> Result<(), Box<dyn std:
     Ok(())
 }
 
+#[cfg(feature = "cuda")]
 fn run_functional_tests(executor: &mut CudaClawExecutor) -> Result<(), Box<dyn std::error::Error>> {
     println!("\n=== Functional Tests ===");
 
@@ -1457,6 +1473,7 @@ fn run_functional_tests(executor: &mut CudaClawExecutor) -> Result<(), Box<dyn s
     Ok(())
 }
 
+#[cfg(feature = "cuda")]
 fn run_agent_dispatcher_demo(
     command_queue: Arc<Mutex<cust::memory::UnifiedBuffer<cuda_claw::CommandQueueHost>>>
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1684,6 +1701,7 @@ fn run_agent_dispatcher_demo(
 ///   Target latency (< 5µs):  ✓ MET
 /// ===================================
 /// ```
+#[cfg(feature = "cuda")]
 fn run_spinlock_benchmark() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n=== Spin-Lock Dispatcher Benchmark ===");
     println!("Ultra-Low Latency GPU Command Dispatch with Atomic Operations\n");
@@ -1796,6 +1814,7 @@ fn run_spinlock_benchmark() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 // Quick benchmark demonstration
+#[cfg(feature = "cuda")]
 fn run_spinlock_quick_test() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n=== SpinLockDispatcher Quick Test ===");
     println!("Testing basic atomic dispatch operations...\n");
@@ -1878,6 +1897,7 @@ fn run_spinlock_quick_test() -> Result<(), Box<dyn std::error::Error>> {
 /// - Update rate: 10Hz (100ms interval)
 /// - Read overhead: ~100-200ns per cell (cached memory access)
 /// - GPU impact: None (read-only, non-blocking)
+#[cfg(feature = "cuda")]
 fn run_monitor_demo(
     _grid_width: usize,
     _grid_height: usize,
@@ -1893,6 +1913,7 @@ fn run_monitor_demo(
 }
 
 /// Quick monitor demonstration
+#[cfg(feature = "cuda")]
 fn run_monitor_quick_demo() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n=== Quick Monitor Demo ===");
     println!("Running 20 update cycles of live monitoring...\n");

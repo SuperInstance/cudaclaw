@@ -223,6 +223,11 @@ impl SuccessAnalyzer {
     fn generate_recommendations(&self, reports: &[FiberReport]) -> Vec<MutationRecommendation> {
         let mut recs = Vec::new();
 
+        // No data → no recommendations.
+        if reports.is_empty() {
+            return recs;
+        }
+
         // ── P99 latency ceiling ──
         let worst_p99 = reports.iter().map(|r| r.p99_latency_us).fold(0.0f64, f64::max);
         let best_p99 = reports

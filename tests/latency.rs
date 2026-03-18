@@ -130,7 +130,7 @@ fn push_command(queue: &mut CommandQueueHost, cmd: Command) -> bool {
             .is_ok()
         {
             let pushed_atomic =
-                &*((&queue.commands_sent as *const u64) as *const AtomicU64);
+                &*((std::ptr::addr_of!(queue.commands_sent)) as *const AtomicU64);
             pushed_atomic.fetch_add(1, Ordering::SeqCst);
             std::sync::atomic::fence(Ordering::SeqCst);
             return true;

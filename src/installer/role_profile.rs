@@ -573,7 +573,7 @@ mod tests {
         };
 
         let profile = ProfileManager::create_profile(
-            &hw, &role, &suggestion, &result, vec![result], None);
+            &hw, &role, &suggestion, &result, vec![result.clone()], None);
         manager.save_profile(&profile).unwrap();
 
         let roles = manager.list_roles().unwrap();
@@ -612,7 +612,7 @@ mod tests {
         };
 
         let profile = ProfileManager::create_profile(
-            &hw, &role, &suggestion, &result, vec![result], None);
+            &hw, &role, &suggestion, &result, vec![result.clone()], None);
         manager.save_profile(&profile).unwrap();
 
         let fp = HardwareFingerprint::from_profile(&hw);

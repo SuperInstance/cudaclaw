@@ -354,21 +354,27 @@ impl GpuMetricsCollector {
 
     /// Serialize all snapshots to JSON
     pub fn to_json(&self) -> serde_json::Value {
+        let max_temp = self.snapshots.iter().filter_map(|s| s.temperature_celsius).max();
+        let avg_util = {
+            let vals = self.snapshots.iter().filter_map(|s| s.gpu_utilization_pct).collect::<Vec<u32>>();
+            if vals.is_empty() { serde_json::Value::Null }
+            else { serde_json::json!(vals.iter().sum::<u32>() as f64 / vals.len() as f64) }
+        };
+        let peak_power = self.snapshots.iter().filter_map(|s| s.power_draw_mw).max().map(|p| p as f64 / 1000.0);
+        let throttle_events = self.snapshots.iter().filter(|s| s.is_throttled()).count();
+        let throttling_detected = self.snapshots.iter().any(|s| s.is_throttled());
+
         serde_json::json!({
             "gpu_index": self.gpu_index,
             "nvml_available": self.nvml_available,
             "snapshot_count": self.snapshots.len(),
             "snapshots": self.snapshots,
             "summary": {
-                "max_temperature_celsius": self.snapshots.iter().filter_map(|s| s.temperature_celsius).max(),
-                "avg_gpu_utilization_pct": {
-                    let vals: Vec<u32> = self.snapshots.iter().filter_map(|s| s.gpu_utilization_pct).collect();
-                    if vals.is_empty() { serde_json::Value::Null }
-                    else { serde_json::json!(vals.iter().sum::<u32>() as f64 / vals.len() as f64) }
-                },
-                "peak_power_draw_watts": self.snapshots.iter().filter_map(|s| s.power_draw_mw).max().map(|p| p as f64 / 1000.0),
-                "throttle_events": self.snapshots.iter().filter(|s| s.is_throttled()).count(),
-                "throttling_detected": self.snapshots.iter().any(|s| s.is_throttled()),
+                "max_temperature_celsius": max_temp,
+                "avg_gpu_utilization_pct": avg_util,
+                "peak_power_draw_watts": peak_power,
+                "throttle_events": throttle_events,
+                "throttling_detected": throttling_detected,
             }
         })
     }

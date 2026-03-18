@@ -56,7 +56,8 @@ use serde::{Deserialize, Serialize};
 
 pub use execution_log::{ExecutionLog, ExecutionEntry, ExecutionSummary};
 pub use success_analyzer::{SuccessAnalyzer, AnalysisReport, FiberReport, MutationRecommendation};
-pub use dna_mutator::{DnaMutator, MutationResult, MutationAction};
+pub use dna_mutator::{DnaMutator, MutationResult};
+pub use success_analyzer::MutationAction;
 
 // ============================================================
 // CLI Integration

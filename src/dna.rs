@@ -622,6 +622,7 @@ impl DnaHardwareFingerprint {
     ///
     /// Returns `None` if CUDA initialization fails or the device index
     /// is out of range.
+    #[cfg(feature = "cuda")]
     pub fn from_cust_device(device_index: u32) -> Option<Self> {
         // Attempt to initialize CUDA context via cust.
         // This will fail gracefully on machines without a GPU.
@@ -1369,11 +1370,18 @@ impl HardwareProbe {
 /// falls back to the simulated RTX 4090 fingerprint with simulated
 /// probe results.
 pub fn probe_hardware(device_index: u32) -> DnaHardwareFingerprint {
+    #[cfg(feature = "cuda")]
     let fingerprint = DnaHardwareFingerprint::from_cust_device(device_index)
         .unwrap_or_else(|| {
             println!("  No CUDA device found — using simulated RTX 4090 profile");
             DnaHardwareFingerprint::rtx4090_simulated()
         });
+    #[cfg(not(feature = "cuda"))]
+    let fingerprint = {
+        let _ = device_index;
+        println!("  CUDA feature not enabled — using simulated RTX 4090 profile");
+        DnaHardwareFingerprint::rtx4090_simulated()
+    };
     HardwareProbe::new(fingerprint).run_all()
 }
 
@@ -2374,6 +2382,7 @@ impl std::error::Error for DnaError {}
 // ============================================================
 
 /// CLI actions for the `dna` subcommand.
+#[derive(Debug)]
 pub enum DnaCliAction {
     Demo,
     Show,
@@ -3117,6 +3126,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "cuda")]
     fn test_from_cust_device_no_gpu() {
         // On CI (no GPU), from_cust_device should return None
         let result = DnaHardwareFingerprint::from_cust_device(0);

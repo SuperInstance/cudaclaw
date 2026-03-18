@@ -38,6 +38,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+fn instant_now() -> Instant { Instant::now() }
+
 // ============================================================
 // GPU Resource Model
 // ============================================================
@@ -114,6 +116,7 @@ pub struct AgentResourceUsage {
     /// Agent's current priority (0 = lowest, 100 = highest).
     pub priority: u32,
     /// When the agent was last active.
+    #[serde(skip, default = "instant_now")]
     pub last_active: Instant,
     /// Cumulative execution time in nanoseconds.
     pub cumulative_exec_ns: u64,
@@ -175,6 +178,7 @@ pub struct SmUtilizationSnapshot {
     /// Overall "nutrient" health score (0.0 = depleted, 1.0 = abundant).
     pub nutrient_score: f64,
     /// When this snapshot was taken.
+    #[serde(skip, default = "instant_now")]
     pub timestamp: Instant,
 }
 
@@ -454,10 +458,12 @@ impl ResourceExhaustionManager {
         agent_id: &str,
         snapshot: &SmUtilizationSnapshot,
     ) -> ExhaustionAction {
-        let usage = match self.agent_usage.get(agent_id) {
-            Some(u) => u,
-            None => return ExhaustionAction::NoAction,
-        };
+        // Copy values from immutable borrow up front to avoid borrow conflicts.
+        let (block_size, priority, registers_used, shared_memory_used, blocks_on_sm) =
+            match self.agent_usage.get(agent_id) {
+                Some(u) => (u.block_size, u.priority, u.registers_used, u.shared_memory_used, u.blocks_on_sm),
+                None => return ExhaustionAction::NoAction,
+            };
 
         // Check if agent has been pruned too many times this epoch.
         let prune_count = self
@@ -471,10 +477,10 @@ impl ResourceExhaustionManager {
         if (snapshot.register_utilization > self.thresholds.register_prune_threshold
             || snapshot.shared_memory_utilization > self.thresholds.shmem_prune_threshold)
             && prune_count < self.thresholds.max_prunes_per_epoch
-            && usage.block_size > self.thresholds.min_block_size
+            && block_size > self.thresholds.min_block_size
         {
-            let new_block_size = (usage.block_size / 2).max(self.thresholds.min_block_size);
-            let new_priority = usage.priority.saturating_sub(10);
+            let new_block_size = (block_size / 2).max(self.thresholds.min_block_size);
+            let new_priority = priority.saturating_sub(10);
 
             *self.epoch_prune_counts.entry(agent_id.to_string()).or_insert(0) += 1;
 
@@ -484,18 +490,18 @@ impl ResourceExhaustionManager {
                 u.priority = new_priority;
                 u.prune_count += 1;
                 // Recalculate resource usage based on new block size.
-                let ratio = new_block_size as f64 / usage.block_size as f64;
-                u.registers_used = (u.registers_used as f64 * ratio) as u32;
-                u.shared_memory_used = (u.shared_memory_used as f64 * ratio) as u32;
-                u.threads_active = new_block_size * u.blocks_on_sm;
+                let ratio = new_block_size as f64 / block_size as f64;
+                u.registers_used = (registers_used as f64 * ratio) as u32;
+                u.shared_memory_used = (shared_memory_used as f64 * ratio) as u32;
+                u.threads_active = new_block_size * blocks_on_sm;
                 u.warps_active = u.threads_active / 32;
             }
 
             return ExhaustionAction::Prune {
                 agent_id: agent_id.to_string(),
-                old_block_size: usage.block_size,
+                old_block_size: block_size,
                 new_block_size,
-                old_priority: usage.priority,
+                old_priority: priority,
                 new_priority,
             };
         }

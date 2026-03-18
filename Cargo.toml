@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# CUDA Rust bindings for GPU programming
-cust = "0.3"
+# CUDA Rust bindings for GPU programming (optional — requires CUDA toolkit)
+cust = { version = "0.3", optional = true }
 
 # Async runtime for host event loop
 tokio = { version = "1.42", features = ["full"] }
@@ -28,4 +28,5 @@ tempfile = "3.9"
 
 [features]
 default = []
+cuda = ["cust"]
 gpu-metrics = ["nvml-wrapper"]
