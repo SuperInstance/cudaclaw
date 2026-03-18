@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# CUDA Rust bindings for GPU programming
-cust = "0.3"
+# CUDA Rust bindings for GPU programming (optional — requires CUDA toolkit)
+cust = { version = "0.3", optional = true }
 
 # Async runtime for host event loop
 tokio = { version = "1.42", features = ["full"] }
@@ -13,3 +13,20 @@ tokio = { version = "1.42", features = ["full"] }
 # Serialization for data structures
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+
+# GPU metrics via NVML (graceful fallback when no GPU present)
+nvml-wrapper = { version = "0.10", optional = true }
+
+# Random number generation for test suite
+rand = "0.8"
+
+# HTTP client for LLM API calls (installer)
+reqwest = { version = "0.11", features = ["json"] }
+
+# Temp directory for tests
+tempfile = "3.9"
+
+[features]
+default = []
+cuda = ["cust"]
+gpu-metrics = ["nvml-wrapper"]
