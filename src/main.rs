@@ -556,7 +556,7 @@ fn run_lock_free_queue_demo() -> Result<(), Box<dyn std::error::Error>> {
                     result_code: 0,
                 };
 
-                let mut queue_guard = queue_clone.lock().unwrap();
+                let mut queue_guard = queue_clone.lock().unwrap_or_else(|e| e.into_inner());
                 if LockFreeCommandQueue::push_command(&mut *queue_guard, cmd) {
                     success_clone.fetch_add(1, Ordering::SeqCst);
                 } else {
@@ -584,7 +584,7 @@ fn run_lock_free_queue_demo() -> Result<(), Box<dyn std::error::Error>> {
     // Final statistics
     println!("\n11. Final Statistics:");
     {
-        let queue_guard = queue_arc.lock().unwrap();
+        let queue_guard = queue_arc.lock().unwrap_or_else(|e| e.into_inner());
         let queue_ref = (*queue_guard).clone();
 
         let (pushed, popped, processed) = LockFreeCommandQueue::get_queue_stats(&queue_ref);

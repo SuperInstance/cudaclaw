@@ -328,7 +328,7 @@ impl GpuDispatcher {
         // Wait for queue space with exponential backoff
         let mut backoff = BACKOFF_INITIAL_US;
         loop {
-            let queue = self.queue.lock().unwrap();
+            let queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
 
             // Check if queue has space
             let head = queue.head;
@@ -382,7 +382,7 @@ impl GpuDispatcher {
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Wait for enough space in queue
         loop {
-            let queue = self.queue.lock().unwrap();
+            let queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
             let head = queue.head;
             let tail = queue.tail;
 
@@ -422,7 +422,7 @@ impl GpuDispatcher {
 
     /// Write command to unified memory queue
     fn write_command_to_queue(&self, cmd: Command) -> Result<(), Box<dyn std::error::Error>> {
-        let mut queue = self.queue.lock().unwrap();
+        let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
         let idx = (queue.head % crate::cuda_claw::QUEUE_SIZE as u32) as usize;
         queue.buffer[idx] = cmd;
         queue.head = (queue.head + 1) % crate::cuda_claw::QUEUE_SIZE as u32;
@@ -432,7 +432,7 @@ impl GpuDispatcher {
 
     /// Signal GPU that commands are ready
     fn signal_gpu(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let mut queue = self.queue.lock().unwrap();
+        let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
         queue.status = QueueStatus::Ready as u32;
 
         // Memory fence ensures GPU sees the write
@@ -456,7 +456,7 @@ impl GpuDispatcher {
         let timeout = Duration::from_millis(timeout_ms);
 
         loop {
-            let queue = self.queue.lock().unwrap();
+            let queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
 
             // Check if command completed
             if queue.status == QueueStatus::Done as u32 {
@@ -466,7 +466,7 @@ impl GpuDispatcher {
                 if cmd.id == cmd_id {
                     // Reset status to idle
                     drop(queue);
-                    let mut queue_mut = self.queue.lock().unwrap();
+                    let mut queue_mut = self.queue.lock().unwrap_or_else(|e| e.into_inner());
                     queue_mut.status = QueueStatus::Idle as u32;
 
                     let complete_time = Instant::now();
@@ -518,7 +518,7 @@ impl GpuDispatcher {
 
     /// Update peak queue depth
     fn update_peak_queue_depth(&self, depth: u32) {
-        let mut stats = self.stats.lock().unwrap();
+        let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
         if depth > stats.peak_queue_depth {
             stats.peak_queue_depth = depth;
         }
@@ -532,7 +532,7 @@ impl GpuDispatcher {
         let total_latency = self.total_latency.load(Ordering::SeqCst);
         let queue_full = self.queue_full_count.load(Ordering::SeqCst);
 
-        let mut stats = self.stats.lock().unwrap();
+        let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
         stats.commands_submitted = submitted;
         stats.commands_completed = completed;
         stats.commands_failed = failed;
@@ -554,7 +554,7 @@ impl GpuDispatcher {
         self.total_latency.store(0, Ordering::SeqCst);
         self.queue_full_count.store(0, Ordering::SeqCst);
 
-        let mut stats = self.stats.lock().unwrap();
+        let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
         *stats = DispatchStats::default();
     }
 
@@ -616,7 +616,7 @@ impl AsyncGpuDispatcher {
 
         // Spawn blocking task for GPU operation
         tokio::task::spawn_blocking(move || {
-            let mut disp = dispatcher.lock().unwrap();
+            let mut disp = dispatcher.lock().unwrap_or_else(|e| e.into_inner());
             disp.dispatch_sync(cmd)
         }).await?
     }
@@ -629,7 +629,7 @@ impl AsyncGpuDispatcher {
         let dispatcher = self.inner.clone();
 
         tokio::task::spawn_blocking(move || {
-            let mut disp = dispatcher.lock().unwrap();
+            let mut disp = dispatcher.lock().unwrap_or_else(|e| e.into_inner());
             disp.dispatch_batch(commands)
         }).await?
     }
@@ -639,7 +639,7 @@ impl AsyncGpuDispatcher {
         let dispatcher = self.inner.clone();
 
         tokio::task::spawn_blocking(move || {
-            let disp = dispatcher.lock().unwrap();
+            let disp = dispatcher.lock().unwrap_or_else(|e| e.into_inner());
             disp.get_stats()
         }).await.unwrap()
     }
@@ -1539,7 +1539,7 @@ impl SpinLockDispatcher {
             // Progress indicator
             if i % 100 == 0 {
                 print!("\r  Progress: {}/{}", i, config.warmup_iterations);
-                std::io::Write::flush(&mut std::io::stdout()).unwrap();
+                let _ = std::io::Write::flush(&mut std::io::stdout());
             }
         }
         println!("\r  Warmup complete: {}/{}", config.warmup_iterations, config.warmup_iterations);
@@ -1570,7 +1570,7 @@ impl SpinLockDispatcher {
             // Progress indicator
             if i % 1000 == 0 {
                 print!("\r  Progress: {}/{}", i, config.num_commands);
-                std::io::Write::flush(&mut std::io::stdout()).unwrap();
+                let _ = std::io::Write::flush(&mut std::io::stdout());
             }
         }
         println!("\r  Measurement complete: {}/{}", config.num_commands, config.num_commands);
