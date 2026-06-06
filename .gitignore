@@ -5,3 +5,4 @@ target/
 *.obj
 *.pdb
 *.ilk
+Cargo.lock
