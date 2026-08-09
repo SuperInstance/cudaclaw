@@ -6,3 +6,5 @@ target/
 *.pdb
 *.ilk
 Cargo.lock
+__pycache__/
+*.pyc
