@@ -16,7 +16,7 @@ class Embedding:
     source: str
 
 class CudaClaw:
-    def __init__(self, plato_url="http://147.224.38.131:8847"):
+    def __init__(self, plato_url="http://<BOAT_IP>:8847"):
         self.plato_url = plato_url
         self.has_cuda = self._check_cuda()
         self.embeddings: Dict[str, Embedding] = {}
