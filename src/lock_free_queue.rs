@@ -98,8 +98,8 @@ unsafe fn atomic_fetch_add_u64(ptr: *const u64, value: u64) -> u64 {
 // Queue State Management
 /// ============================================================
 
-/// Queue capacity (must match QUEUE_SIZE in CUDA)
-pub const QUEUE_SIZE: u32 = 16;
+/// Queue capacity (must match QUEUE_SIZE in CUDA and cuda_claw.rs)
+pub const QUEUE_SIZE: u32 = 1024;
 
 /// Queue states for synchronization
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -161,12 +161,7 @@ impl LockFreeCommandQueue {
     ///     id: 1,
     ///     timestamp: 12345,
     ///     data_a: 10.0,
-    ///     data_b: 20.0,
-    ///     result: 0.0,
-    ///     batch_data: 0,
-    ///     batch_count: 0,
-    ///     _padding: 0,
-    ///     result_code: 0,
+    ///     data_b: 0.0,
     /// };
     ///
     /// if LockFreeCommandQueue::push_command(&mut queue, cmd) {
@@ -195,7 +190,7 @@ impl LockFreeCommandQueue {
             // Write command to slot
             // NOTE: We write the command before advancing head
             // The GPU won't read this slot until head is advanced
-            queue.commands[index as usize] = cmd;
+            queue.buffer[index as usize] = cmd;
 
             // Memory fence to ensure command is written before head advances
             std::sync::atomic::fence(Ordering::SeqCst);
@@ -205,11 +200,11 @@ impl LockFreeCommandQueue {
             if atomic_compare_exchange_u32(&queue.head as *const u32, head, next_head) {
                 // Successfully claimed this slot
                 // Update statistics
-                atomic_fetch_add_u64(&queue.commands_pushed as *const u64, 1);
+                atomic_fetch_add_u64(std::ptr::addr_of!(queue.commands_sent), 1);
 
                 // Update queue status if needed
-                if queue.status == QueueStatus::STATUS_IDLE {
-                    queue.status = QueueStatus::STATUS_READY;
+                if queue.status == QueueStatus::Idle as u32 {
+                    queue.status = QueueStatus::Ready as u32;
                 }
 
                 // Memory fence to ensure all writes are visible
@@ -396,8 +391,8 @@ impl LockFreeCommandQueue {
     #[inline]
     pub fn get_queue_stats(queue: &CommandQueueHost) -> (u64, u64, u64) {
         (
-            queue.commands_pushed,
-            queue.commands_popped,
+            queue.commands_sent,
+            0, // commands_popped not tracked separately
             queue.commands_processed,
         )
     }
@@ -424,7 +419,7 @@ impl LockFreeCommandQueue {
     pub fn reset_queue(queue: &mut CommandQueueHost) {
         queue.head = 0;
         queue.tail = 0;
-        queue.status = QueueStatus::STATUS_IDLE;
+        queue.status = QueueStatus::Idle as u32;
         // Note: We don't reset the statistics counters
     }
 
@@ -477,16 +472,13 @@ mod tests {
         let mut queue: CommandQueueHost = unsafe { zeroed() };
 
         let cmd = Command {
-            cmd_type: CommandType::CMD_ADD,
+            cmd_type: CommandType::Add as u32,
             id: 1,
             timestamp: 0,
             data_a: 10.0,
-            data_b: 20.0,
+            data_b: i as f32 * 20.0,
             result: 0.0,
             batch_data: 0,
-            batch_count: 0,
-            _padding: 0,
-            result_code: 0,
         };
 
         assert!(LockFreeCommandQueue::push_command(&mut queue, cmd));
@@ -499,16 +491,13 @@ mod tests {
         let mut queue: CommandQueueHost = unsafe { zeroed() };
 
         let cmd = Command {
-            cmd_type: CommandType::CMD_NO_OP,
+            cmd_type: CommandType::NoOp as u32,
             id: 0,
             timestamp: 0,
             data_a: 0.0,
             data_b: 0.0,
             result: 0.0,
             batch_data: 0,
-            batch_count: 0,
-            _padding: 0,
-            result_code: 0,
         };
 
         // Fill queue to capacity (QUEUE_SIZE - 1 to distinguish full from empty)
@@ -528,16 +517,13 @@ mod tests {
         let mut queue: CommandQueueHost = unsafe { zeroed() };
 
         let cmd = Command {
-            cmd_type: CommandType::CMD_NO_OP,
+            cmd_type: CommandType::NoOp as u32,
             id: 0,
             timestamp: 0,
             data_a: 0.0,
             data_b: 0.0,
             result: 0.0,
             batch_data: 0,
-            batch_count: 0,
-            _padding: 0,
-            result_code: 0,
         };
 
         let commands = vec![cmd; 5];

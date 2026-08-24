@@ -5,3 +5,7 @@ target/
 *.obj
 *.pdb
 *.ilk
+Cargo.lock
+__pycache__/
+*.pyc
+__pycache__/

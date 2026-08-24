@@ -19,7 +19,7 @@ pub fn load_ptx(name: &str) -> Result<String, Box<dyn std::error::Error>> {
         return Err(format!("PTX file not found: {:?}", ptx_path).into());
     }
 
-    fs::read_to_string(ptx_path)
+    fs::read_to_string(&ptx_path)
         .map_err(|e| format!("Failed to read PTX file {:?}: {}", ptx_path, e).into())
 }
 
